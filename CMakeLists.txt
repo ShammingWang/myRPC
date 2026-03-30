@@ -8,4 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(simple_tcp_server
     src/main.cpp
+    src/server.cpp
+    src/session.cpp
+    src/socket_utils.cpp
 )
