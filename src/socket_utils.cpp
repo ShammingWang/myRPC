@@ -6,6 +6,7 @@
 #include <iostream>
 #include <unistd.h>
 
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 
@@ -66,4 +67,19 @@ int CreateListenSocket(uint16_t port) {
     }
 
     return guard.release();
+}
+
+bool SetNonBlocking(int fd) {
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        std::cerr << "fcntl(F_GETFL) failed: " << std::strerror(errno) << '\n';
+        return false;
+    }
+
+    if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        std::cerr << "fcntl(F_SETFL) failed: " << std::strerror(errno) << '\n';
+        return false;
+    }
+
+    return true;
 }

@@ -2,6 +2,9 @@
 
 #include <cstdint>
 #include <csignal>
+#include <unordered_map>
+
+#include "session.h"
 
 class Server {
 public:
@@ -12,10 +15,15 @@ public:
     void Stop();
 
 private:
-    void HandleConnection(int conn_fd) const;
+    bool InitEpoll();
+    void AcceptConnections();
+    void CloseConnection(int conn_fd);
+    bool UpdateInterest(int conn_fd, const Session& session);
 
     uint16_t port_;
     int listen_fd_ = -1;
+    int epoll_fd_ = -1;
+    std::unordered_map<int, Session> sessions_;
 };
 
 extern volatile std::sig_atomic_t g_running;

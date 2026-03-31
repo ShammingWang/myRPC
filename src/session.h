@@ -6,14 +6,22 @@ class Session {
 public:
     Session(int conn_fd, std::string client_label);
 
-    void Run();
+    void OnConnected() const;
+    bool OnReadable();
+    bool OnWritable();
+    bool WantsWrite() const;
+    bool ShouldClose() const;
+    void OnClosed() const;
 
 private:
-    bool ReadLine(std::string& line);
-    bool WriteAll(const std::string& response);
+    bool DrainReads();
+    bool DrainWrites();
+    void ProcessRequests();
     std::string BuildResponse(const std::string& request) const;
 
     int conn_fd_;
     std::string client_label_;
     std::string pending_data_;
+    std::string pending_write_;
+    bool peer_closed_ = false;
 };

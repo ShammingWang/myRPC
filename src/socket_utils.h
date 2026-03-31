@@ -24,3 +24,4 @@ private:
 };
 
 int CreateListenSocket(uint16_t port);
+bool SetNonBlocking(int fd);
