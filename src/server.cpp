@@ -9,8 +9,8 @@
 #include <string>
 #include <unistd.h>
 
-#include <sys/epoll.h>
 #include <netinet/in.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 
 namespace {
@@ -18,12 +18,12 @@ namespace {
 constexpr int kMaxEvents = 64;
 constexpr int kEpollWaitTimeoutMs = 1000;
 
-uint32_t BuildSessionEvents(const Session& session) {
+uint32_t BuildConnectionEvents(const Connection& connection) {
     uint32_t events = EPOLLRDHUP;
-    if (!session.ShouldClose()) {
+    if (!connection.ShouldClose()) {
         events |= EPOLLIN;
     }
-    if (session.WantsWrite()) {
+    if (connection.WantsWrite()) {
         events |= EPOLLOUT;
     }
     return events;
@@ -34,6 +34,10 @@ uint32_t BuildSessionEvents(const Session& session) {
 volatile std::sig_atomic_t g_running = 1;
 
 Server::Server(uint16_t port) : port_(port) {}
+
+void Server::RegisterHandler(std::string method, RpcDispatcher::Handler handler) {
+    dispatcher_.RegisterHandler(std::move(method), std::move(handler));
+}
 
 bool Server::Start() {
     listen_fd_ = CreateListenSocket(port_);
@@ -59,8 +63,7 @@ void Server::Run() {
 
     epoll_event events[kMaxEvents];
     while (g_running) {
-        const int ready =
-            ::epoll_wait(epoll_fd_, events, kMaxEvents, kEpollWaitTimeoutMs);
+        const int ready = ::epoll_wait(epoll_fd_, events, kMaxEvents, kEpollWaitTimeoutMs);
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
@@ -78,8 +81,8 @@ void Server::Run() {
                 continue;
             }
 
-            auto it = sessions_.find(fd);
-            if (it == sessions_.end()) {
+            auto it = connections_.find(fd);
+            if (it == connections_.end()) {
                 continue;
             }
 
@@ -110,7 +113,7 @@ void Server::Run() {
 }
 
 void Server::Stop() {
-    for (auto it = sessions_.begin(); it != sessions_.end();) {
+    for (auto it = connections_.begin(); it != connections_.end();) {
         const int conn_fd = it->first;
         ++it;
         CloseConnection(conn_fd);
@@ -175,12 +178,13 @@ void Server::AcceptConnections() {
             continue;
         }
 
-        Session session(
-            conn_fd, std::string(client_ip) + ":" + std::to_string(::ntohs(client_addr.sin_port)));
-        session.OnConnected();
+        Connection connection(
+            conn_fd, std::string(client_ip) + ":" + std::to_string(::ntohs(client_addr.sin_port)),
+            dispatcher_);
+        connection.OnConnected();
 
         epoll_event event{};
-        event.events = BuildSessionEvents(session);
+        event.events = BuildConnectionEvents(connection);
         event.data.fd = conn_fd;
         if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, conn_fd, &event) < 0) {
             std::cerr << "epoll_ctl add conn fd failed: " << std::strerror(errno) << '\n';
@@ -188,13 +192,13 @@ void Server::AcceptConnections() {
             continue;
         }
 
-        sessions_.emplace(conn_fd, std::move(session));
+        connections_.emplace(conn_fd, std::move(connection));
     }
 }
 
 void Server::CloseConnection(int conn_fd) {
-    auto it = sessions_.find(conn_fd);
-    if (it == sessions_.end()) {
+    auto it = connections_.find(conn_fd);
+    if (it == connections_.end()) {
         return;
     }
 
@@ -204,12 +208,12 @@ void Server::CloseConnection(int conn_fd) {
         std::cerr << "epoll_ctl del conn fd failed: " << std::strerror(errno) << '\n';
     }
     ::close(conn_fd);
-    sessions_.erase(it);
+    connections_.erase(it);
 }
 
-bool Server::UpdateInterest(int conn_fd, const Session& session) {
+bool Server::UpdateInterest(int conn_fd, const Connection& connection) {
     epoll_event event{};
-    event.events = BuildSessionEvents(session);
+    event.events = BuildConnectionEvents(connection);
     event.data.fd = conn_fd;
     if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, conn_fd, &event) < 0) {
         std::cerr << "epoll_ctl mod conn fd failed: " << std::strerror(errno) << '\n';

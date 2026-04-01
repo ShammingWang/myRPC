@@ -1,2 +1,4 @@
 build/
 .codex
+.venv/
+__pycache__/

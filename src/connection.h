@@ -2,9 +2,12 @@
 
 #include <string>
 
-class Session {
+#include "rpc_codec.h"
+#include "rpc_dispatcher.h"
+
+class Connection {
 public:
-    Session(int conn_fd, std::string client_label);
+    Connection(int conn_fd, std::string client_label, const RpcDispatcher& dispatcher);
 
     void OnConnected() const;
     bool OnReadable();
@@ -16,12 +19,13 @@ public:
 private:
     bool DrainReads();
     bool DrainWrites();
-    void ProcessRequests();
-    std::string BuildResponse(const std::string& request) const;
+    bool ProcessRequests();
 
     int conn_fd_;
     std::string client_label_;
-    std::string pending_data_;
-    std::string pending_write_;
+    const RpcDispatcher& dispatcher_;
+    RpcCodec codec_;
+    std::string inbound_buffer_;
+    std::string outbound_buffer_;
     bool peer_closed_ = false;
 };
