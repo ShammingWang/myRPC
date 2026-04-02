@@ -27,12 +27,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", default="echo", help="RPC method name")
     parser.add_argument("--payload", default="hello rpc", help="request payload")
     parser.add_argument(
-        "--connections", type=int, default=10, help="number of concurrent client connections"
+        "--connections", type=int, default=100, help="number of concurrent client connections"
     )
     parser.add_argument(
         "--requests",
         type=int,
-        default=1000,
+        default=10000,
         help="total request count; ignored when --duration is set",
     )
     parser.add_argument(
