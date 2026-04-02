@@ -11,8 +11,10 @@ constexpr size_t kBufferSize = 4096;
 
 }  // namespace
 
-Connection::Connection(int conn_fd, std::string client_label, const RpcDispatcher& dispatcher)
-    : conn_fd_(conn_fd), client_label_(std::move(client_label)), dispatcher_(dispatcher) {}
+Connection::Connection(int conn_fd, std::string client_label, RequestExecutor request_executor)
+    : conn_fd_(conn_fd),
+      client_label_(std::move(client_label)),
+      request_executor_(std::move(request_executor)) {}
 
 void Connection::OnConnected() const {
     std::cout << "accepted connection from " << client_label_ << '\n';
@@ -35,11 +37,18 @@ bool Connection::WantsWrite() const {
 }
 
 bool Connection::ShouldClose() const {
-    return peer_closed_ && outbound_buffer_.empty();
+    return peer_closed_ && outbound_buffer_.empty() && pending_requests_ == 0;
 }
 
 void Connection::OnClosed() const {
     std::cout << "connection closed: " << client_label_ << '\n';
+}
+
+void Connection::QueueResponse(const RpcResponse& response) {
+    codec_.EncodeResponse(response, outbound_buffer_);
+    if (pending_requests_ > 0) {
+        --pending_requests_;
+    }
 }
 
 bool Connection::DrainReads() {
@@ -103,10 +112,7 @@ bool Connection::ProcessRequests() {
             return true;
         }
 
-        std::cout << "request " << request.request_id << " from " << client_label_
-                  << " method=" << request.method << " payload=" << request.payload << '\n';
-
-        const RpcResponse response = dispatcher_.Dispatch(request);
-        codec_.EncodeResponse(response, outbound_buffer_);
+        ++pending_requests_;
+        request_executor_(std::move(request));
     }
 }

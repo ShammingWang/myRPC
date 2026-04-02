@@ -3,6 +3,7 @@
 #include "socket_utils.h"
 
 #include <arpa/inet.h>
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <iostream>
@@ -10,6 +11,7 @@
 #include <unistd.h>
 
 #include <netinet/in.h>
+#include <sys/eventfd.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 
@@ -33,7 +35,8 @@ uint32_t BuildConnectionEvents(const Connection& connection) {
 
 volatile std::sig_atomic_t g_running = 1;
 
-Server::Server(uint16_t port) : port_(port) {}
+Server::Server(uint16_t port)
+    : port_(port), worker_pool_(std::max(1u, std::thread::hardware_concurrency())) {}
 
 void Server::RegisterHandler(std::string method, RpcDispatcher::Handler handler) {
     dispatcher_.RegisterHandler(std::move(method), std::move(handler));
@@ -80,6 +83,12 @@ void Server::Run() {
                 AcceptConnections();
                 continue;
             }
+            if (fd == wake_fd_) {
+                if (!DrainCompletedResponses()) {
+                    break;
+                }
+                continue;
+            }
 
             auto it = connections_.find(fd);
             if (it == connections_.end()) {
@@ -113,6 +122,8 @@ void Server::Run() {
 }
 
 void Server::Stop() {
+    worker_pool_.Stop();
+
     for (auto it = connections_.begin(); it != connections_.end();) {
         const int conn_fd = it->first;
         ++it;
@@ -122,6 +133,11 @@ void Server::Stop() {
     if (epoll_fd_ >= 0) {
         ::close(epoll_fd_);
         epoll_fd_ = -1;
+    }
+
+    if (wake_fd_ >= 0) {
+        ::close(wake_fd_);
+        wake_fd_ = -1;
     }
 
     if (listen_fd_ >= 0) {
@@ -142,6 +158,20 @@ bool Server::InitEpoll() {
     event.data.fd = listen_fd_;
     if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &event) < 0) {
         std::cerr << "epoll_ctl add listen fd failed: " << std::strerror(errno) << '\n';
+        return false;
+    }
+
+    wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (wake_fd_ < 0) {
+        std::cerr << "eventfd failed: " << std::strerror(errno) << '\n';
+        return false;
+    }
+
+    event = {};
+    event.events = EPOLLIN;
+    event.data.fd = wake_fd_;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &event) < 0) {
+        std::cerr << "epoll_ctl add wake fd failed: " << std::strerror(errno) << '\n';
         return false;
     }
 
@@ -180,7 +210,7 @@ void Server::AcceptConnections() {
 
         Connection connection(
             conn_fd, std::string(client_ip) + ":" + std::to_string(::ntohs(client_addr.sin_port)),
-            dispatcher_);
+            [this, conn_fd](RpcRequest request) { DispatchRequest(conn_fd, std::move(request)); });
         connection.OnConnected();
 
         epoll_event event{};
@@ -219,6 +249,79 @@ bool Server::UpdateInterest(int conn_fd, const Connection& connection) {
         std::cerr << "epoll_ctl mod conn fd failed: " << std::strerror(errno) << '\n';
         return false;
     }
+    return true;
+}
+
+void Server::DispatchRequest(int conn_fd, RpcRequest request) {
+    const uint64_t request_id = request.request_id;
+    const bool submitted = worker_pool_.Submit([this, conn_fd, request = std::move(request)]() mutable {
+        RpcResponse response = dispatcher_.Dispatch(request);
+        EnqueueResponse(conn_fd, std::move(response));
+    });
+
+    if (!submitted) {
+        RpcResponse response;
+        response.request_id = request_id;
+        response.status_code = 503;
+        response.payload = "worker pool unavailable";
+        EnqueueResponse(conn_fd, std::move(response));
+    }
+}
+
+void Server::EnqueueResponse(int conn_fd, RpcResponse response) {
+    {
+        std::lock_guard<std::mutex> lock(completed_mutex_);
+        completed_responses_.push(PendingResponse{conn_fd, std::move(response)});
+    }
+
+    const uint64_t wake_value = 1;
+    if (::write(wake_fd_, &wake_value, sizeof(wake_value)) < 0 && errno != EAGAIN) {
+        std::cerr << "wake write failed: " << std::strerror(errno) << '\n';
+    }
+}
+
+bool Server::DrainCompletedResponses() {
+    while (true) {
+        uint64_t wake_value = 0;
+        const ssize_t n = ::read(wake_fd_, &wake_value, sizeof(wake_value));
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            std::cerr << "wake read failed: " << std::strerror(errno) << '\n';
+            return false;
+        }
+        break;
+    }
+
+    std::queue<PendingResponse> completed;
+    {
+        std::lock_guard<std::mutex> lock(completed_mutex_);
+        completed.swap(completed_responses_);
+    }
+
+    while (!completed.empty()) {
+        PendingResponse pending = std::move(completed.front());
+        completed.pop();
+
+        auto it = connections_.find(pending.conn_fd);
+        if (it == connections_.end()) {
+            continue;
+        }
+
+        it->second.QueueResponse(pending.response);
+        if (it->second.ShouldClose()) {
+            CloseConnection(pending.conn_fd);
+            continue;
+        }
+        if (!UpdateInterest(pending.conn_fd, it->second)) {
+            CloseConnection(pending.conn_fd);
+        }
+    }
+
     return true;
 }
 
