@@ -13,4 +13,5 @@ add_executable(simple_tcp_server
     src/rpc_dispatcher.cpp
     src/server.cpp
     src/socket_utils.cpp
+    src/worker_pool.cpp
 )
