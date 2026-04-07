@@ -19,7 +19,7 @@ HEADER_SIZE = HEADER_STRUCT.size
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="myRPC socket benchmark tool",
+        description="myRPC Python benchmark client",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--host", default="127.0.0.1", help="server host")
@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expect-payload",
         default=None,
-        help="optional expected response payload, useful for functional validation during pressure testing",
+        help="optional expected response payload for validation",
     )
     parser.add_argument(
         "--reconnect-per-request",

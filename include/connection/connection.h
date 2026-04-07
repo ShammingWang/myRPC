@@ -3,8 +3,8 @@
 #include <functional>
 #include <string>
 
-#include "rpc_codec.h"
-#include "rpc_message.h"
+#include "codec/rpc_codec.h"
+#include "codec/rpc_message.h"
 
 class Connection {
 public:

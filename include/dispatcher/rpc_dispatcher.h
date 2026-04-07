@@ -4,7 +4,7 @@
 #include <string>
 #include <unordered_map>
 
-#include "rpc_message.h"
+#include "codec/rpc_message.h"
 
 class RpcDispatcher {
 public:

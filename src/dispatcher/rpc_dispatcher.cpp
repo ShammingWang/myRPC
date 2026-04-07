@@ -1,4 +1,4 @@
-#include "rpc_dispatcher.h"
+#include "dispatcher/rpc_dispatcher.h"
 
 #include <exception>
 

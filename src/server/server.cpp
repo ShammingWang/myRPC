@@ -1,6 +1,6 @@
-#include "server.h"
+#include "server/server.h"
 
-#include "socket_utils.h"
+#include "server/socket_utils.h"
 
 #include <arpa/inet.h>
 #include <algorithm>

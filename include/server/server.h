@@ -7,10 +7,10 @@
 #include <string>
 #include <unordered_map>
 
-#include "connection.h"
-#include "rpc_dispatcher.h"
-#include "rpc_message.h"
-#include "worker_pool.h"
+#include "codec/rpc_message.h"
+#include "connection/connection.h"
+#include "dispatcher/rpc_dispatcher.h"
+#include "worker/worker_pool.h"
 
 class Server {
 public:

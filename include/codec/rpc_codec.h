@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <string>
 
-#include "rpc_message.h"
+#include "codec/rpc_message.h"
 
 class RpcCodec {
 public:

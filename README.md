@@ -4,6 +4,36 @@
 
 当前阶段已经从“最基础的 TCP 网络通信”推进到了“最小 RPC 雏形”。
 
+## Project Layout
+
+```text
+rpc-project/
+├── CMakeLists.txt
+├── README.md
+├── docs/
+│   ├── architecture.md
+│   ├── protocol.md
+│   └── benchmark.md
+├── src/
+│   ├── server/
+│   ├── codec/
+│   ├── dispatcher/
+│   ├── connection/
+│   └── worker/
+├── include/
+├── examples/
+│   └── simple_client.cpp
+├── bench/
+│   ├── cpp_bench_client.cpp
+│   ├── run_bench.sh
+│   ├── cases/
+│   └── results/
+├── tests/
+│   ├── unit/
+│   └── integration/
+└── scripts/
+```
+
 ## 当前能力
 
 - 监听指定端口
@@ -95,9 +125,17 @@ with socket.create_connection(("127.0.0.1", 8080)) as sock:
 PY
 ```
 
-## 压测工具
+## Benchmark
 
-项目根目录下提供了一个单文件压测脚本 `bench_rpc.py`，用于对当前 MRPC 服务做并发请求压测。
+项目内已经整理出一套 benchmark 目录，主压测入口是 C++ 版 client，Python 版脚本放在 `scripts/` 里作为补充工具：
+
+```text
+bench/
+├── cpp_bench_client.cpp
+├── run_bench.sh
+├── cases/
+└── results/
+```
 
 先启动服务：
 
@@ -105,36 +143,64 @@ PY
 ./build/simple_tcp_server
 ```
 
-再执行压测：
+### 编译 benchmark client
 
 ```bash
-python3 bench_rpc.py --connections 50 --requests 10000 --method echo --payload "hello rpc"
+cmake -S . -B build
+cmake --build build
+```
+
+C++ benchmark 可执行文件为：
+
+```bash
+./build/mrpc_bench_client
+```
+
+### 运行 benchmark
+
+Python 版本：
+
+```bash
+python3 scripts/bench_python.py --connections 50 --requests 10000 --method echo --payload "hello rpc"
+```
+
+C++ 版本：
+
+```bash
+./build/mrpc_bench_client --connections 50 --requests 10000 --method echo --payload "hello rpc"
 ```
 
 按固定时长压测：
 
 ```bash
-python3 bench_rpc.py --connections 20 --duration 30 --method uppercase --payload "hello"
+./build/mrpc_bench_client --connections 20 --duration 30 --method uppercase --payload "hello" --expect-payload "HELLO"
 ```
 
-如果想在压测时同时校验返回值，可以这样执行：
+两个版本当前都支持：
+
+- `host / port / method / payload`
+- `connections`
+- `requests` 或 `duration`
+- 连接复用，以及 `--reconnect-per-request`
+- 输出 `QPS / avg / p50 / p99 / throughput / failures`
+
+查看参数：
 
 ```bash
-python3 bench_rpc.py --connections 20 --duration 30 --method uppercase --payload "hello" --expect-payload "HELLO"
+python3 scripts/bench_python.py --help
+./build/mrpc_bench_client --help
 ```
 
-脚本会输出：
+### 如何看结果
 
-- 成功数 / 失败数
-- QPS
-- 收发吞吐
-- 平均延迟、p50、p90、p99、最大延迟
+输出里重点关注这些指标：
 
-查看全部参数：
+- `QPS`：每秒成功请求数
+- `Latency avg / p50 / p99`：平均延迟与尾延迟
+- `Tx / Rx throughput`：发送和接收吞吐
+- `Failures`：失败请求数
 
-```bash
-python3 bench_rpc.py --help
-```
+更完整的记录模板见 [benchmark.md](/home/shamming/projects/myRPC/docs/benchmark.md)。
 
 ## 性能基线
 
@@ -154,7 +220,7 @@ python3 bench_rpc.py --help
 测试命令模板：
 
 ```bash
-python3 bench_rpc.py --connections <N> --duration 8 --method echo --payload "hello rpc" --expect-payload "hello rpc"
+python3 scripts/bench_python.py --connections <N> --duration 8 --method echo --payload "hello rpc" --expect-payload "hello rpc"
 ```
 
 结果如下：
