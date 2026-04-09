@@ -8,10 +8,17 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include_directories(include)
 
+add_library(mrpc_client_lib
+    src/client/rpc_client.cpp
+    src/codec/rpc_codec.cpp
+    src/codec/rpc_serialization.cpp
+)
+
 add_executable(simple_tcp_server
     src/server/main.cpp
     src/connection/connection.cpp
     src/codec/rpc_codec.cpp
+    src/codec/rpc_serialization.cpp
     src/dispatcher/rpc_dispatcher.cpp
     src/server/server.cpp
     src/server/socket_utils.cpp
@@ -25,3 +32,5 @@ add_executable(mrpc_bench_client
 add_executable(simple_client
     examples/simple_client.cpp
 )
+
+target_link_libraries(simple_client PRIVATE mrpc_client_lib)
