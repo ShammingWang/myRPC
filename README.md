@@ -2,7 +2,7 @@
 
 这是一个面向 RPC 学习路线的练手项目。
 
-当前阶段已经从“最基础的 TCP 网络通信”推进到了“最小 RPC 雏形”。
+当前阶段已经从“最基础的 TCP 网络通信”推进到了“更像基础组件的一版最小 RPC 框架”。
 
 ## Project Layout
 
@@ -40,11 +40,16 @@ rpc-project/
 - 基于 `epoll` 的单线程 IO 多路复用
 - 业务线程池异步执行 handler，IO 线程只负责网络收发和编解码
 - 并发处理多个客户端连接
-- 二进制长度字段帧协议
+- Service / Method 服务模型，支持 `EchoService.Echo` 这类方法命名
+- 正式 `RpcClient`，支持连接管理、请求发送、响应匹配与超时控制
+- 二进制长度字段帧协议，支持序列化类型与请求超时字段
 - `request_id` 关联请求和响应
 - `Connection + Codec + Dispatcher` 三层结构
 - 单连接内连续处理多条 RPC 请求
-- 内置 `echo` 和 `uppercase` 两个示例方法
+- 连接级背压控制：最大 in-flight 请求数、写缓冲上限
+- 空闲连接回收与请求超时处理
+- 可插拔序列化元数据，内置 `raw` 和 `json`
+- 更细的错误码体系，区分协议、序列化、超时和网络错误
 
 ## 构建
 
@@ -63,15 +68,19 @@ cmake --build build
 
 ## 协议格式
 
-请求和响应都使用固定 24 字节包头：
+请求和响应都使用固定 34 字节包头：
 
 ```text
 4 bytes   magic      固定为 "MRPC"
 1 byte    version    当前为 1
 1 byte    type       1=request, 2=response
+1 byte    serialization 0=raw, 1=json
+1 byte    reserved
 2 bytes   status     请求时固定为 0，响应时表示状态码
 4 bytes   method_len 请求方法名长度，响应固定为 0
 4 bytes   body_len   负载长度
+4 bytes   timeout_ms 请求超时时间，响应固定为 0
+4 bytes   reserved
 8 bytes   request_id 请求 ID
 ```
 
@@ -89,40 +98,10 @@ payload bytes
 
 ## 最小测试
 
-可以用下面这段 Python 发两个请求到同一个连接，验证多请求复用：
+可以直接跑项目里的正式客户端示例：
 
 ```bash
-python3 - <<'PY'
-import socket
-import struct
-
-def pack_request(request_id, method, payload):
-    method_b = method.encode()
-    payload_b = payload.encode()
-    header = struct.pack("!IBBHIIQ", 0x4D525043, 1, 1, 0, len(method_b), len(payload_b), request_id)
-    return header + method_b + payload_b
-
-def read_response(sock):
-    header = sock.recv(24)
-    magic, version, msg_type, status, method_len, body_len, request_id = struct.unpack("!IBBHIIQ", header)
-    body = b""
-    while len(body) < body_len:
-        body += sock.recv(body_len - len(body))
-    return {
-        "magic": hex(magic),
-        "version": version,
-        "type": msg_type,
-        "status": status,
-        "request_id": request_id,
-        "payload": body.decode(),
-    }
-
-with socket.create_connection(("127.0.0.1", 8080)) as sock:
-    sock.sendall(pack_request(1, "echo", "hello rpc"))
-    sock.sendall(pack_request(2, "uppercase", "hello again"))
-    print(read_response(sock))
-    print(read_response(sock))
-PY
+./build/simple_client
 ```
 
 ## Benchmark
@@ -161,19 +140,19 @@ C++ benchmark 可执行文件为：
 Python 版本：
 
 ```bash
-python3 scripts/bench_python.py --connections 50 --requests 10000 --method echo --payload "hello rpc"
+python3 scripts/bench_python.py --connections 50 --requests 10000 --method EchoService.Echo --payload "hello rpc"
 ```
 
 C++ 版本：
 
 ```bash
-./build/mrpc_bench_client --connections 50 --requests 10000 --method echo --payload "hello rpc"
+./build/mrpc_bench_client --connections 50 --requests 10000 --method EchoService.Echo --payload "hello rpc"
 ```
 
 按固定时长压测：
 
 ```bash
-./build/mrpc_bench_client --connections 20 --duration 30 --method uppercase --payload "hello" --expect-payload "HELLO"
+./build/mrpc_bench_client --connections 20 --duration 30 --method EchoService.Uppercase --payload "hello" --expect-payload "HELLO"
 ```
 
 两个版本当前都支持：
@@ -208,10 +187,10 @@ python3 scripts/bench_python.py --help
 
 测试口径：
 
-- 服务端为当前 `WorkerPool` 版本
+- 服务端为当前 `Service + RpcClient + timeout/backpressure` 版本
 - 临时关闭了请求级日志，只保留连接级日志
 - 本机回环 `127.0.0.1:8080`
-- `echo` 方法
+- `EchoService.Echo` 方法
 - payload 固定为 `hello rpc`，大小 `9 bytes`
 - 连接复用，不开启 `--reconnect-per-request`
 - 每组压测时长 `8s`
@@ -220,7 +199,7 @@ python3 scripts/bench_python.py --help
 测试命令模板：
 
 ```bash
-python3 scripts/bench_python.py --connections <N> --duration 8 --method echo --payload "hello rpc" --expect-payload "hello rpc"
+python3 scripts/bench_python.py --connections <N> --duration 8 --method EchoService.Echo --payload "hello rpc" --expect-payload "hello rpc"
 ```
 
 结果如下：
@@ -242,6 +221,6 @@ python3 scripts/bench_python.py --connections <N> --duration 8 --method echo --p
 
 ## 下一步建议
 
-1. 把 `Dispatcher` 从“方法名到函数”升级成真正的服务注册中心。
-2. 给 `Connection` 增加写缓冲上限、请求超时和空闲连接清理。
+1. 给 `RpcClient` 增加连接池、自动重连和异步调用接口。
+2. 把 `json` serializer 从“轻校验”升级成真正的结构化序列化。
 3. 继续把线程池细化成独立的 IO 线程池和业务线程池。

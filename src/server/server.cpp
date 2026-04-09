@@ -35,11 +35,18 @@ uint32_t BuildConnectionEvents(const Connection& connection) {
 
 volatile std::sig_atomic_t g_running = 1;
 
-Server::Server(uint16_t port)
-    : port_(port), worker_pool_(std::max(1u, std::thread::hardware_concurrency())) {}
+Server::Server(uint16_t port, ServerOptions options)
+    : port_(port),
+      options_(options),
+      worker_pool_(std::max(1u, std::thread::hardware_concurrency())) {}
 
-void Server::RegisterHandler(std::string method, RpcDispatcher::Handler handler) {
-    dispatcher_.RegisterHandler(std::move(method), std::move(handler));
+void Server::RegisterMethod(std::string service, std::string method,
+                            RpcDispatcher::MethodHandler handler) {
+    dispatcher_.RegisterMethod(std::move(service), std::move(method), std::move(handler));
+}
+
+void Server::RegisterService(const RpcService& service) {
+    dispatcher_.RegisterService(service);
 }
 
 bool Server::Start() {
@@ -73,6 +80,10 @@ void Server::Run() {
             }
             std::cerr << "epoll_wait failed: " << std::strerror(errno) << '\n';
             break;
+        }
+
+        if (ready == 0) {
+            CloseIdleConnections();
         }
 
         for (int i = 0; i < ready; ++i) {
@@ -210,7 +221,9 @@ void Server::AcceptConnections() {
 
         Connection connection(
             conn_fd, std::string(client_ip) + ":" + std::to_string(::ntohs(client_addr.sin_port)),
-            [this, conn_fd](RpcRequest request) { DispatchRequest(conn_fd, std::move(request)); });
+            [this, conn_fd](RpcRequest request) { DispatchRequest(conn_fd, std::move(request)); },
+            ConnectionOptions{options_.max_pending_requests_per_connection,
+                              options_.max_outbound_buffer_bytes_per_connection});
         connection.OnConnected();
 
         epoll_event event{};
@@ -255,14 +268,24 @@ bool Server::UpdateInterest(int conn_fd, const Connection& connection) {
 void Server::DispatchRequest(int conn_fd, RpcRequest request) {
     const uint64_t request_id = request.request_id;
     const bool submitted = worker_pool_.Submit([this, conn_fd, request = std::move(request)]() mutable {
+        if (IsRequestTimedOut(request, std::chrono::steady_clock::now())) {
+            EnqueueResponse(conn_fd, BuildTimeoutResponse(request));
+            return;
+        }
+
         RpcResponse response = dispatcher_.Dispatch(request);
+        if (IsSuccess(response.status_code) &&
+            IsRequestTimedOut(request, std::chrono::steady_clock::now())) {
+            response = BuildTimeoutResponse(request);
+        }
         EnqueueResponse(conn_fd, std::move(response));
     });
 
     if (!submitted) {
         RpcResponse response;
         response.request_id = request_id;
-        response.status_code = 503;
+        response.serialization = request.serialization;
+        response.status_code = RpcStatusCode::kServerOverloaded;
         response.payload = "worker pool unavailable";
         EnqueueResponse(conn_fd, std::move(response));
     }
@@ -312,7 +335,10 @@ bool Server::DrainCompletedResponses() {
             continue;
         }
 
-        it->second.QueueResponse(pending.response);
+        if (!it->second.QueueResponse(pending.response)) {
+            CloseConnection(pending.conn_fd);
+            continue;
+        }
         if (it->second.ShouldClose()) {
             CloseConnection(pending.conn_fd);
             continue;
@@ -323,6 +349,29 @@ bool Server::DrainCompletedResponses() {
     }
 
     return true;
+}
+
+void Server::CloseIdleConnections() {
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = connections_.begin(); it != connections_.end();) {
+        if (!it->second.IsIdleFor(now, options_.idle_connection_timeout)) {
+            ++it;
+            continue;
+        }
+
+        const int conn_fd = it->first;
+        ++it;
+        CloseConnection(conn_fd);
+    }
+}
+
+RpcResponse Server::BuildTimeoutResponse(const RpcRequest& request) const {
+    RpcResponse response;
+    response.request_id = request.request_id;
+    response.serialization = request.serialization;
+    response.status_code = RpcStatusCode::kRequestTimeout;
+    response.payload = "request timed out before completion";
+    return response;
 }
 
 void HandleSignal(int) {

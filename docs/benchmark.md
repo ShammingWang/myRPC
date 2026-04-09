@@ -30,13 +30,13 @@ cmake --build build
 Python 版本：
 
 ```bash
-python3 scripts/bench_python.py --connections 50 --duration 8 --method echo --payload "hello rpc"
+python3 scripts/bench_python.py --connections 50 --duration 8 --method EchoService.Echo --payload "hello rpc"
 ```
 
 C++ 版本：
 
 ```bash
-./build/mrpc_bench_client --connections 50 --duration 8 --method echo --payload "hello rpc"
+./build/mrpc_bench_client --connections 50 --duration 8 --method EchoService.Echo --payload "hello rpc"
 ```
 
 ## 建议记录项
