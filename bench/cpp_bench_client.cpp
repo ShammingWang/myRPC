@@ -27,12 +27,13 @@ constexpr uint32_t kMagic = 0x4D525043;
 constexpr uint8_t kVersion = 1;
 constexpr uint8_t kRequestType = 1;
 constexpr uint8_t kResponseType = 2;
-constexpr size_t kHeaderSize = 24;
+constexpr uint8_t kRawSerialization = 0;
+constexpr size_t kHeaderSize = 34;
 
 struct Args {
     std::string host = "127.0.0.1";
     uint16_t port = 8080;
-    std::string method = "echo";
+    std::string method = "EchoService.Echo";
     std::string payload = "hello rpc";
     int connections = 100;
     uint64_t requests = 10000;
@@ -197,7 +198,7 @@ void PrintUsage(const char* program) {
         << "Usage: " << program << " [options]\n"
         << "  --host <host>                  Server host (default: 127.0.0.1)\n"
         << "  --port <port>                  Server port (default: 8080)\n"
-        << "  --method <method>              RPC method name (default: echo)\n"
+        << "  --method <method>              RPC method name (default: EchoService.Echo)\n"
         << "  --payload <payload>            RPC payload (default: hello rpc)\n"
         << "  --connections <n>              Concurrent connections (default: 100)\n"
         << "  --requests <n>                 Total requests in count mode (default: 10000)\n"
@@ -272,9 +273,13 @@ std::string BuildRequest(uint64_t request_id, const std::string& method, const s
     AppendUint32(packet, kMagic);
     packet.push_back(static_cast<char>(kVersion));
     packet.push_back(static_cast<char>(kRequestType));
+    packet.push_back(static_cast<char>(kRawSerialization));
+    packet.push_back(0);
     AppendUint16(packet, 0);
     AppendUint32(packet, static_cast<uint32_t>(method.size()));
     AppendUint32(packet, static_cast<uint32_t>(payload.size()));
+    AppendUint32(packet, 0);
+    AppendUint32(packet, 0);
     AppendUint64(packet, request_id);
     packet.append(method);
     packet.append(payload);
@@ -319,10 +324,10 @@ Response ReadResponse(int fd) {
     const uint32_t magic = LoadUint32(header);
     const uint8_t version = static_cast<uint8_t>(header[4]);
     const uint8_t type = static_cast<uint8_t>(header[5]);
-    const uint16_t status = LoadUint16(header + 6);
-    const uint32_t method_len = LoadUint32(header + 8);
-    const uint32_t body_len = LoadUint32(header + 12);
-    const uint64_t request_id = LoadUint64(header + 16);
+    const uint16_t status = LoadUint16(header + 8);
+    const uint32_t method_len = LoadUint32(header + 10);
+    const uint32_t body_len = LoadUint32(header + 14);
+    const uint64_t request_id = LoadUint64(header + 26);
 
     if (magic != kMagic) {
         throw std::runtime_error("invalid magic in response");

@@ -13,7 +13,8 @@ MAGIC = 0x4D525043  # MRPC
 VERSION = 1
 REQUEST_TYPE = 1
 RESPONSE_TYPE = 2
-HEADER_STRUCT = struct.Struct("!IBBHIIQ")
+RAW_SERIALIZATION = 0
+HEADER_STRUCT = struct.Struct("!IBBBBHIIIIQ")
 HEADER_SIZE = HEADER_STRUCT.size
 
 
@@ -24,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--host", default="127.0.0.1", help="server host")
     parser.add_argument("--port", type=int, default=8080, help="server port")
-    parser.add_argument("--method", default="echo", help="RPC method name")
+    parser.add_argument("--method", default="EchoService.Echo", help="RPC method name")
     parser.add_argument("--payload", default="hello rpc", help="request payload")
     parser.add_argument(
         "--connections", type=int, default=100, help="number of concurrent client connections"
@@ -77,9 +78,13 @@ def build_request(request_id: int, method: bytes, payload: bytes) -> bytes:
         MAGIC,
         VERSION,
         REQUEST_TYPE,
+        RAW_SERIALIZATION,
+        0,
         0,
         len(method),
         len(payload),
+        0,
+        0,
         request_id,
     )
     return header + method + payload
@@ -97,7 +102,7 @@ def recv_exact(sock: socket.socket, length: int) -> bytes:
 
 def read_response(sock: socket.socket) -> tuple[int, int, bytes]:
     header = recv_exact(sock, HEADER_SIZE)
-    magic, version, msg_type, status, method_len, body_len, request_id = HEADER_STRUCT.unpack(
+    magic, version, msg_type, serialization, reserved, status, method_len, body_len, timeout_ms, reserved2, request_id = HEADER_STRUCT.unpack(
         header
     )
     if magic != MAGIC:
@@ -106,6 +111,8 @@ def read_response(sock: socket.socket) -> tuple[int, int, bytes]:
         raise ValueError(f"unsupported version: {version}")
     if msg_type != RESPONSE_TYPE:
         raise ValueError(f"unexpected message type: {msg_type}")
+    if serialization != RAW_SERIALIZATION:
+        raise ValueError(f"unexpected serialization type: {serialization}")
     if method_len != 0:
         raise ValueError(f"unexpected response method length: {method_len}")
     body = recv_exact(sock, body_len)
