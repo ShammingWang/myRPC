@@ -37,7 +37,7 @@ rpc-project/
 ## 当前能力
 
 - 监听指定端口
-- 基于 `epoll` 的单线程 IO 多路复用
+- 主线程 `accept` + 多个 IO 线程基于 `epoll` 处理连接读写
 - 业务线程池异步执行 handler，IO 线程只负责网络收发和编解码
 - 并发处理多个客户端连接
 - Service / Method 服务模型，支持 `EchoService.Echo` 这类方法命名

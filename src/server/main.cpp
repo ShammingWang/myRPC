@@ -5,6 +5,7 @@
 #include <csignal>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -12,6 +13,20 @@
 namespace {
 
 constexpr uint16_t kDefaultPort = 8080;
+
+size_t ReadIoThreadCountFromEnv() {
+    const char* value = std::getenv("MRPC_IO_THREADS");
+    if (value == nullptr || *value == '\0') {
+        return 0;
+    }
+
+    try {
+        return static_cast<size_t>(std::stoull(value));
+    } catch (...) {
+        std::cerr << "invalid MRPC_IO_THREADS value: " << value << '\n';
+        return 0;
+    }
+}
 
 std::string ToUpper(std::string input) {
     std::transform(input.begin(), input.end(), input.begin(), [](unsigned char ch) {
@@ -48,6 +63,7 @@ int main() {
     options.idle_connection_timeout = std::chrono::seconds(30);
     options.max_pending_requests_per_connection = 256;
     options.max_outbound_buffer_bytes_per_connection = 512 * 1024;
+    options.io_thread_count = ReadIoThreadCountFromEnv();
 
     Server server(kDefaultPort, options);
     EchoService echo_service;
