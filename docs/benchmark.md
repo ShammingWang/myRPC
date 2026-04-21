@@ -1,11 +1,12 @@
 # Benchmark Notes
 
-这个文档用于记录 `myRPC` benchmark 的测试口径、执行命令和阶段性结果，方便后续做横向对比。
+这个文档用于记录 `myRPC` benchmark 的测试口径、执行命令和阶段性结果，方便后续做横向对比。当前推荐入口是 `bench/run_suite.py`，它会用同一套固定矩阵生成可重复的报告。
 
 ## 目录结构
 
 ```text
 bench/
+├── run_suite.py
 ├── cpp_bench_client.cpp
 ├── run_bench.sh
 ├── cases/
@@ -20,6 +21,8 @@ cmake --build build
 ```
 
 ## 运行方式
+
+## 快速单次压测
 
 先启动服务端：
 
@@ -39,6 +42,43 @@ C++ 版本：
 ./build/mrpc_bench_client --connections 50 --duration 8 --method EchoService.Echo --payload "hello rpc"
 ```
 
+如果需要机器可读输出，可以加 `--report-format json`。
+
+## 正式 Benchmark Suite
+
+推荐使用统一入口：
+
+```bash
+python3 bench/run_suite.py --label observability-baseline
+```
+
+这条命令会自动：
+
+- 为每个 case 启动独立服务端实例
+- 固定使用同一套 `throughput / io thread scaling / payload scaling` 矩阵
+- 每个 case 先跑 warmup，再跑多次 measured repeats
+- 生成 `metadata.json / raw_runs.json / summary.csv / report.md`
+
+默认矩阵如下：
+
+- Throughput sweep：`connections=50,100,200,400`，`payload=16 B`
+- IO thread scaling：`io_threads=1,2,4,8,16`，`connections=200`，`payload=16 B`
+- Payload sweep：`payload=16,256,4096,16384 B`，`connections=200`
+
+常用参数：
+
+- `--duration 6 --warmup 2 --repeats 3`：控制每个 case 的测试时长和重复次数
+- `--baseline-io-threads 8`：设置默认基线 IO 线程数
+- `--compare-with bench/results/<old>/summary.csv`：和上一次报告做前后对比
+- `--output-dir bench/results/<name>`：自定义结果输出目录
+
+推荐对比流程：
+
+1. 在当前基线版本执行一次 suite，保留生成的 `summary.csv`
+2. 做优化改动
+3. 再执行一次 suite，并把旧的 `summary.csv` 传给 `--compare-with`
+4. 直接查看新生成的 `report.md` 中的 `QPS vs Prev / P99 vs Prev`
+
 ## 建议记录项
 
 - 测试日期
@@ -48,19 +88,24 @@ C++ 版本：
 - 是否连接复用
 - connections / requests / duration
 - payload 大小
-- QPS / avg / p50 / p99 / throughput / failures
+- QPS / avg / p50 / p90 / p99 / p999 / throughput / failures
 
 ## 结果模板
 
-| Date | Commit | Client | Connections | Mode | Payload | QPS | Avg | P50 | P99 | Tx | Rx | Failures |
-| --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2026-04-07 | example | python | 50 | duration=8s | 9 B | TBD | TBD | TBD | TBD | TBD | TBD | 0 |
-| 2026-04-07 | example | cpp | 50 | duration=8s | 9 B | TBD | TBD | TBD | TBD | TBD | TBD | 0 |
+`bench/run_suite.py` 会自动生成：
+
+- `metadata.json`：测试环境、commit、参数
+- `raw_runs.json`：每次 measured run 的原始结果
+- `summary.csv`：按 case 聚合后的机器可读汇总
+- `report.md`：适合提交到仓库的 Markdown 报告
+
+可以把 `report.md` 直接 copy 到 `bench/results/<timestamp>/` 下长期归档。
 
 ## 说明
 
-- 第一版 benchmark client 重点是提供一个稳定的项目内压测入口，而不是做完整性能分析平台。
-- 后续可以在 C++ 版本继续补 `warmup`、`pipeline depth`、`histogram` 和 `CSV` 导出。
+- 统一 suite 的目标是保证“每次优化都跑同一套基准”，先稳定复现，再讨论进一步的 profiling。
+- 当前 suite 聚焦回环网络下框架内部路径的对比，更适合评估线程模型、协议路径和序列化/拷贝成本。
+- 如果后续要扩展成更完整的性能平台，可以继续补充 `perf`、火焰图、CPU 利用率和 `/metrics` 抓取。
 
 ## 2026-04-11 Single IO vs Multi IO
 

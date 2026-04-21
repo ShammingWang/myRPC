@@ -1,0 +1,13 @@
+{
+  "timestamp": "2026-04-22T00:26:12",
+  "commit": "45774b1",
+  "label": "baseline",
+  "machine": "Linux 6.6.87.2-microsoft-standard-WSL2, x86_64, cpu_count=16",
+  "method": "EchoService.Echo",
+  "duration_seconds": 6.0,
+  "warmup_seconds": 2.0,
+  "repeats": 3,
+  "host": "127.0.0.1",
+  "port": 8080,
+  "admin_port": 0
+}

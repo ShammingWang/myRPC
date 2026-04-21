@@ -16,6 +16,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -42,6 +43,7 @@ struct Args {
     uint16_t expect_status = 0;
     std::optional<std::string> expect_payload;
     bool reconnect_per_request = false;
+    std::string report_format = "text";
 };
 
 struct Response {
@@ -116,6 +118,26 @@ struct SharedState {
     std::mutex latencies_mutex;
     std::vector<double> latencies_ms;
     std::mutex error_mutex;
+    std::string first_error;
+};
+
+struct ReportStats {
+    double elapsed_seconds = 0.0;
+    uint64_t success = 0;
+    uint64_t failures = 0;
+    uint64_t total_completed = 0;
+    uint64_t bytes_sent = 0;
+    uint64_t bytes_received = 0;
+    double qps = 0.0;
+    double tx_kib_per_s = 0.0;
+    double rx_kib_per_s = 0.0;
+    double avg_latency_ms = 0.0;
+    double min_latency_ms = 0.0;
+    double p50_latency_ms = 0.0;
+    double p90_latency_ms = 0.0;
+    double p99_latency_ms = 0.0;
+    double p999_latency_ms = 0.0;
+    double max_latency_ms = 0.0;
     std::string first_error;
 };
 
@@ -206,6 +228,7 @@ void PrintUsage(const char* program) {
         << "  --timeout <seconds>            Socket timeout (default: 5)\n"
         << "  --expect-status <code>         Expected response status (default: 0)\n"
         << "  --expect-payload <payload>     Expected response payload\n"
+        << "  --report-format <text|json>    Output format (default: text)\n"
         << "  --reconnect-per-request        Disable connection reuse\n"
         << "  --help                         Show this help message\n";
 }
@@ -241,6 +264,8 @@ Args ParseArgs(int argc, char** argv) {
             args.expect_status = static_cast<uint16_t>(std::stoul(require_value("--expect-status")));
         } else if (flag == "--expect-payload") {
             args.expect_payload = require_value("--expect-payload");
+        } else if (flag == "--report-format") {
+            args.report_format = require_value("--report-format");
         } else if (flag == "--reconnect-per-request") {
             args.reconnect_per_request = true;
         } else if (flag == "--help" || flag == "-h") {
@@ -263,8 +288,43 @@ Args ParseArgs(int argc, char** argv) {
     if (args.timeout <= 0.0) {
         throw std::invalid_argument("--timeout must be > 0");
     }
+    if (args.report_format != "text" && args.report_format != "json") {
+        throw std::invalid_argument("--report-format must be text or json");
+    }
 
     return args;
+}
+
+std::string JsonEscape(const std::string& input) {
+    std::ostringstream out;
+    for (const char ch : input) {
+        switch (ch) {
+            case '\\':
+                out << "\\\\";
+                break;
+            case '"':
+                out << "\\\"";
+                break;
+            case '\n':
+                out << "\\n";
+                break;
+            case '\r':
+                out << "\\r";
+                break;
+            case '\t':
+                out << "\\t";
+                break;
+            default:
+                if (static_cast<unsigned char>(ch) < 0x20) {
+                    out << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                        << static_cast<int>(static_cast<unsigned char>(ch)) << std::dec
+                        << std::setfill(' ');
+                } else {
+                    out << ch;
+                }
+        }
+    }
+    return out.str();
 }
 
 std::string BuildRequest(uint64_t request_id, const std::string& method, const std::string& payload) {
@@ -405,6 +465,47 @@ double Percentile(const std::vector<double>& sorted_values, double ratio) {
     return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight;
 }
 
+ReportStats BuildReportStats(const SharedState& state) {
+    ReportStats stats;
+    stats.elapsed_seconds = std::max(
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - state.start).count(),
+        1e-9);
+
+    std::vector<double> latencies;
+    {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(state.latencies_mutex));
+        latencies = state.latencies_ms;
+    }
+    std::sort(latencies.begin(), latencies.end());
+
+    stats.success = state.success.load(std::memory_order_relaxed);
+    stats.failures = state.failures.load(std::memory_order_relaxed);
+    stats.total_completed = stats.success + stats.failures;
+    stats.bytes_sent = state.bytes_sent.load(std::memory_order_relaxed);
+    stats.bytes_received = state.bytes_received.load(std::memory_order_relaxed);
+    stats.qps = static_cast<double>(stats.success) / stats.elapsed_seconds;
+    stats.tx_kib_per_s = static_cast<double>(stats.bytes_sent) / stats.elapsed_seconds / 1024.0;
+    stats.rx_kib_per_s =
+        static_cast<double>(stats.bytes_received) / stats.elapsed_seconds / 1024.0;
+
+    if (!latencies.empty()) {
+        stats.avg_latency_ms =
+            std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
+        stats.min_latency_ms = latencies.front();
+        stats.p50_latency_ms = Percentile(latencies, 0.50);
+        stats.p90_latency_ms = Percentile(latencies, 0.90);
+        stats.p99_latency_ms = Percentile(latencies, 0.99);
+        stats.p999_latency_ms = Percentile(latencies, 0.999);
+        stats.max_latency_ms = latencies.back();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(state.error_mutex));
+        stats.first_error = state.first_error;
+    }
+    return stats;
+}
+
 void WorkerLoop(int worker_id, const Args& args, SharedState& state) {
     SocketHandle connection;
 
@@ -483,57 +584,64 @@ void WorkerLoop(int worker_id, const Args& args, SharedState& state) {
 }
 
 int PrintReport(const Args& args, const SharedState& state) {
-    const double elapsed = std::max(
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - state.start).count(),
-        1e-9);
+    const ReportStats stats = BuildReportStats(state);
 
-    std::vector<double> latencies;
-    {
-        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(state.latencies_mutex));
-        latencies = state.latencies_ms;
-    }
-    std::sort(latencies.begin(), latencies.end());
-
-    const uint64_t success = state.success.load(std::memory_order_relaxed);
-    const uint64_t failures = state.failures.load(std::memory_order_relaxed);
-    const uint64_t total_completed = success + failures;
-    const double avg_latency = latencies.empty()
-        ? 0.0
-        : std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
-
-    std::cout << "Benchmark finished\n";
-    std::cout << "Target       : " << args.host << ":" << args.port << "\n";
-    std::cout << "Method       : " << args.method << "\n";
-    std::cout << "Payload size : " << args.payload.size() << " bytes\n";
-    std::cout << "Connections  : " << args.connections << "\n";
-    std::cout << std::fixed << std::setprecision(3);
-    std::cout << "Elapsed      : " << elapsed << " s\n";
-    std::cout << "Completed    : " << total_completed << "\n";
-    std::cout << "Success      : " << success << "\n";
-    std::cout << "Failures     : " << failures << "\n";
-    std::cout << std::setprecision(2);
-    std::cout << "QPS          : " << static_cast<double>(success) / elapsed << "\n";
-    std::cout << "Tx throughput: "
-              << static_cast<double>(state.bytes_sent.load(std::memory_order_relaxed)) / elapsed / 1024.0
-              << " KiB/s\n";
-    std::cout << "Rx throughput: "
-              << static_cast<double>(state.bytes_received.load(std::memory_order_relaxed)) / elapsed / 1024.0
-              << " KiB/s\n";
-
-    if (!latencies.empty()) {
+    if (args.report_format == "json") {
+        std::cout << std::fixed << std::setprecision(6);
+        std::cout << "{\n";
+        std::cout << "  \"target\": \"" << JsonEscape(args.host) << ":" << args.port << "\",\n";
+        std::cout << "  \"method\": \"" << JsonEscape(args.method) << "\",\n";
+        std::cout << "  \"payload_size_bytes\": " << args.payload.size() << ",\n";
+        std::cout << "  \"connections\": " << args.connections << ",\n";
+        std::cout << "  \"reconnect_per_request\": "
+                  << (args.reconnect_per_request ? "true" : "false") << ",\n";
+        std::cout << "  \"elapsed_seconds\": " << stats.elapsed_seconds << ",\n";
+        std::cout << "  \"completed\": " << stats.total_completed << ",\n";
+        std::cout << "  \"success\": " << stats.success << ",\n";
+        std::cout << "  \"failures\": " << stats.failures << ",\n";
+        std::cout << "  \"qps\": " << stats.qps << ",\n";
+        std::cout << "  \"tx_kib_per_s\": " << stats.tx_kib_per_s << ",\n";
+        std::cout << "  \"rx_kib_per_s\": " << stats.rx_kib_per_s << ",\n";
+        std::cout << "  \"latency_ms\": {\n";
+        std::cout << "    \"avg\": " << stats.avg_latency_ms << ",\n";
+        std::cout << "    \"min\": " << stats.min_latency_ms << ",\n";
+        std::cout << "    \"p50\": " << stats.p50_latency_ms << ",\n";
+        std::cout << "    \"p90\": " << stats.p90_latency_ms << ",\n";
+        std::cout << "    \"p99\": " << stats.p99_latency_ms << ",\n";
+        std::cout << "    \"p999\": " << stats.p999_latency_ms << ",\n";
+        std::cout << "    \"max\": " << stats.max_latency_ms << "\n";
+        std::cout << "  },\n";
+        std::cout << "  \"first_error\": \"" << JsonEscape(stats.first_error) << "\"\n";
+        std::cout << "}\n";
+    } else {
+        std::cout << "Benchmark finished\n";
+        std::cout << "Target       : " << args.host << ":" << args.port << "\n";
+        std::cout << "Method       : " << args.method << "\n";
+        std::cout << "Payload size : " << args.payload.size() << " bytes\n";
+        std::cout << "Connections  : " << args.connections << "\n";
+        std::cout << std::fixed << std::setprecision(3);
+        std::cout << "Elapsed      : " << stats.elapsed_seconds << " s\n";
+        std::cout << "Completed    : " << stats.total_completed << "\n";
+        std::cout << "Success      : " << stats.success << "\n";
+        std::cout << "Failures     : " << stats.failures << "\n";
+        std::cout << std::setprecision(2);
+        std::cout << "QPS          : " << stats.qps << "\n";
+        std::cout << "Tx throughput: " << stats.tx_kib_per_s << " KiB/s\n";
+        std::cout << "Rx throughput: " << stats.rx_kib_per_s << " KiB/s\n";
         std::cout << std::setprecision(3);
-        std::cout << "Latency avg  : " << avg_latency << " ms\n";
-        std::cout << "Latency min  : " << latencies.front() << " ms\n";
-        std::cout << "Latency p50  : " << Percentile(latencies, 0.50) << " ms\n";
-        std::cout << "Latency p99  : " << Percentile(latencies, 0.99) << " ms\n";
-        std::cout << "Latency max  : " << latencies.back() << " ms\n";
+        std::cout << "Latency avg  : " << stats.avg_latency_ms << " ms\n";
+        std::cout << "Latency min  : " << stats.min_latency_ms << " ms\n";
+        std::cout << "Latency p50  : " << stats.p50_latency_ms << " ms\n";
+        std::cout << "Latency p90  : " << stats.p90_latency_ms << " ms\n";
+        std::cout << "Latency p99  : " << stats.p99_latency_ms << " ms\n";
+        std::cout << "Latency p999 : " << stats.p999_latency_ms << " ms\n";
+        std::cout << "Latency max  : " << stats.max_latency_ms << " ms\n";
+        if (!stats.first_error.empty()) {
+            std::cout << "First error  : " << stats.first_error << "\n";
+        }
     }
 
-    if (!state.first_error.empty()) {
-        std::cout << "First error  : " << state.first_error << "\n";
-    }
-
-    return failures == 0 ? 0 : 1;
+    return stats.failures == 0 ? 0 : 1;
 }
 
 }  // namespace
