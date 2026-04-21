@@ -165,7 +165,7 @@ bool Connection::ProcessRequests() {
 
         ++pending_requests_;
         if (options_.observability) {
-            options_.observability->OnRequestDecoded();
+            options_.observability->OnRequestDecoded(request);
         }
         request_executor_(std::move(request));
     }
