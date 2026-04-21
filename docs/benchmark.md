@@ -20,8 +20,6 @@ cmake -S . -B build
 cmake --build build
 ```
 
-## 运行方式
-
 ## 快速单次压测
 
 先启动服务端：
@@ -30,13 +28,7 @@ cmake --build build
 ./build/simple_tcp_server
 ```
 
-Python 版本：
-
-```bash
-python3 scripts/bench_python.py --connections 50 --duration 8 --method EchoService.Echo --payload "hello rpc"
-```
-
-C++ 版本：
+使用 C++ benchmark client：
 
 ```bash
 ./build/mrpc_bench_client --connections 50 --duration 8 --method EchoService.Echo --payload "hello rpc"
@@ -79,6 +71,36 @@ python3 bench/run_suite.py --label observability-baseline
 3. 再执行一次 suite，并把旧的 `summary.csv` 传给 `--compare-with`
 4. 直接查看新生成的 `report.md` 中的 `QPS vs Prev / P99 vs Prev`
 
+## 字段定义
+
+正式 benchmark 报告里最常见的字段含义如下：
+
+- `Connections`
+  客户端同时建立并复用的并发 TCP 连接数。当前 `mrpc_bench_client` 默认每个 worker 对应一条长连接，单连接上 `in-flight=1`。
+- `IO Threads`
+  服务端 IO 线程数量，对应环境变量 `MRPC_IO_THREADS`。这不是客户端线程数，也不是 worker pool 线程数。
+- `QPS`
+  每秒成功请求数，只统计返回成功的请求吞吐。
+- `Latency avg / p50 / p90 / p99 / p999`
+  请求端到端延迟分位数，`p99 / p999` 更适合观察高压下的尾延迟变化。
+- `Tx / Rx throughput`
+  benchmark client 观测到的发送与接收吞吐，单位为 `KiB/s`。
+- `Failures`
+  本轮压测中发生的失败请求数；正式 baseline 应优先保证它保持为 `0`。
+
+## 为什么固定这三类维度
+
+当前 suite 选择 `throughput / io thread scaling / payload scaling` 三组 case，是为了分别回答三类问题：
+
+- `throughput`
+  固定 `IO Threads` 和 payload，只改变 `Connections`，用来观察系统在负载上升时的吞吐上限和尾延迟变化。
+- `io thread scaling`
+  固定 `Connections` 和 payload，只改变服务端 IO 线程数，用来验证多 IO 线程架构的扩展性，以及最佳线程数大概落在哪个区间。
+- `payload scaling`
+  固定 `Connections` 和 `IO Threads`，只改变 payload 大小，用来观察协议路径、拷贝和缓冲区成本随消息体增长的变化。
+
+这三类 case 共同组成一套“最小但有效”的性能基线，能在不引入太多变量的前提下，帮助定位下一步优化方向。
+
 ## 建议记录项
 
 - 测试日期
@@ -106,6 +128,7 @@ python3 bench/run_suite.py --label observability-baseline
 - 统一 suite 的目标是保证“每次优化都跑同一套基准”，先稳定复现，再讨论进一步的 profiling。
 - 当前 suite 聚焦回环网络下框架内部路径的对比，更适合评估线程模型、协议路径和序列化/拷贝成本。
 - 如果后续要扩展成更完整的性能平台，可以继续补充 `perf`、火焰图、CPU 利用率和 `/metrics` 抓取。
+- 当前项目的测试和性能回归统一走 `bench/` 目录，不再维护 `scripts/` 下的辅助压测入口。
 
 ## 2026-04-11 Single IO vs Multi IO
 

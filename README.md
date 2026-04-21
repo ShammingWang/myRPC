@@ -1,8 +1,25 @@
 # myRPC
 
-这是一个面向 RPC 学习路线的练手项目。
+`myRPC` 是一个基于 `C++` 和 `Linux socket/epoll` 的轻量 RPC 框架原型项目。
 
-当前阶段已经从“最基础的 TCP 网络通信”推进到了“更像基础组件的一版最小 RPC 框架”。
+这个项目的目标不是只做“能收发请求的 demo”，而是逐步补齐一个基础 RPC 运行时最重要的几块能力：
+
+- 多 IO 线程网络模型
+- 业务线程池与请求分发
+- 请求超时、连接治理与背压
+- `/metrics`、slow log、request trace 等可观测性
+- 可重复执行的 benchmark suite 与性能基线
+
+当前代码已经具备一条完整的最小闭环，适合继续做线程模型、协议路径、序列化和尾延迟优化实验。
+
+## Snapshot
+
+- 网络模型：主线程 `accept` + 多 IO 线程 `epoll` reactor
+- 请求执行：`WorkerPool` 异步执行 handler，响应回投到原 IO 线程
+- 协议模型：自定义 MRPC 二进制协议，使用 `request_id` 关联请求与响应
+- 可观测性：`/metrics`、slow log、request trace
+- 压测体系：正式 `C++ benchmark client` + 固定矩阵的 `bench/run_suite.py`
+- 当前 benchmark 基线：`8` 个 IO 线程下约 `45k-50k QPS`，`400` 连接时尾延迟开始明显放大
 
 ## Project Layout
 
@@ -31,7 +48,6 @@ rpc-project/
 ├── tests/
 │   ├── unit/
 │   └── integration/
-└── scripts/
 ```
 
 ## 当前能力
@@ -51,6 +67,20 @@ rpc-project/
 - 可插拔序列化元数据，内置 `raw` 和 `json`
 - 更细的错误码体系，区分协议、序列化、超时和网络错误
 - 内建 observability：周期性 metrics、slow log、request trace
+
+## 架构概览
+
+核心请求路径如下：
+
+1. 主线程接收 TCP 连接，并按 round-robin 分发给某个 IO 线程。
+2. IO 线程把连接注册到自己的 `epoll` 实例，负责后续读写事件。
+3. `Connection` 从读缓冲中取字节流，交给 `RpcCodec` 解析为 `RpcRequest`。
+4. `Server` 将请求投递到 `WorkerPool`，业务 handler 在工作线程中执行。
+5. `RpcDispatcher` 按 `Service.Method` 查找方法并生成 `RpcResponse`。
+6. 响应经 `eventfd` 回投到目标 IO 线程，由 `Connection` 编码并写回客户端。
+7. `Observability` 在 decode、分发、回投、发送等节点汇总指标与日志。
+
+更完整说明见 [architecture.md](/home/shamming/projects/myRPC/docs/architecture.md)。
 
 ## 构建
 
@@ -74,6 +104,12 @@ cmake --build build
 - `MRPC_SLOW_REQUEST_MS`：慢请求阈值，默认 `50`
 - `MRPC_ENABLE_REQUEST_TRACE`：是否开启 request trace，默认 `true`
 - `MRPC_TRACE_ALL_REQUESTS`：是否打印所有请求 trace，默认 `false`
+
+服务启动后：
+
+- RPC 服务默认监听 `0.0.0.0:8080`
+- 管理端口默认监听 `0.0.0.0:9090`
+- 可通过 `http://127.0.0.1:9090/metrics` 查看当前指标
 
 ## 协议格式
 
@@ -115,7 +151,9 @@ payload bytes
 
 ## Benchmark
 
-项目内已经整理出一套 benchmark 目录，主压测入口是 C++ 版 client，Python 版脚本放在 `scripts/` 里作为补充工具：
+项目内测试与性能回归统一走 `bench/` 目录下的 C++ client 和 suite 脚本。
+
+项目内已经整理出一套 benchmark 目录，正式压测入口是 C++ 版 client：
 
 ```text
 bench/
@@ -125,70 +163,83 @@ bench/
 └── results/
 ```
 
-先启动服务：
+### 快速单次压测
 
 ```bash
 ./build/simple_tcp_server
 ```
 
-### 编译 benchmark client
+另开一个终端执行：
 
 ```bash
-cmake -S . -B build
-cmake --build build
+./build/mrpc_bench_client \
+  --connections 50 \
+  --duration 8 \
+  --method EchoService.Echo \
+  --payload "hello rpc" \
+  --expect-payload "hello rpc"
 ```
 
-C++ benchmark 可执行文件为：
+如果需要机器可读结果：
 
 ```bash
-./build/mrpc_bench_client
+./build/mrpc_bench_client \
+  --connections 50 \
+  --duration 8 \
+  --method EchoService.Echo \
+  --payload "hello rpc" \
+  --expect-payload "hello rpc" \
+  --report-format json
 ```
 
-### 运行 benchmark
+### 正式 Benchmark Suite
 
-Python 版本：
+推荐的正式入口是：
 
 ```bash
-python3 scripts/bench_python.py --connections 50 --requests 10000 --method EchoService.Echo --payload "hello rpc"
+python3 bench/run_suite.py --label baseline
 ```
 
-C++ 版本：
+它会自动：
+
+- 为每个 case 启动独立服务端实例
+- 固定执行 `throughput / io thread scaling / payload scaling` 三组测试
+- 对每个 case 先 warmup，再做 measured repeats
+- 生成 `metadata.json / raw_runs.json / summary.csv / report.md`
+
+默认矩阵：
+
+- Throughput：`connections=50,100,200,400`，`payload=16 B`
+- IO thread scaling：`io_threads=1,2,4,8,16`，`connections=200`
+- Payload scaling：`payload=16,256,4096,16384 B`，`connections=200`
+
+重要字段含义：
+
+- `Connections`：客户端同时建立并复用的并发 TCP 连接数
+- `IO Threads`：服务端 IO 线程数量，对应 `MRPC_IO_THREADS`
+- `QPS`：每秒成功请求数
+- `P50 / P99 / P999`：中位延迟、尾延迟、极尾延迟
+
+推荐流程：
+
+1. 跑一版基线：`python3 bench/run_suite.py --label baseline`
+2. 做代码优化
+3. 跑新版本并和旧结果对比：
 
 ```bash
-./build/mrpc_bench_client --connections 50 --requests 10000 --method EchoService.Echo --payload "hello rpc"
+python3 bench/run_suite.py \
+  --label after-opt \
+  --compare-with bench/results/<baseline-dir>/summary.csv
 ```
 
-按固定时长压测：
-
-```bash
-./build/mrpc_bench_client --connections 20 --duration 30 --method EchoService.Uppercase --payload "hello" --expect-payload "HELLO"
-```
-
-两个版本当前都支持：
-
-- `host / port / method / payload`
-- `connections`
-- `requests` 或 `duration`
-- 连接复用，以及 `--reconnect-per-request`
-- 输出 `QPS / avg / p50 / p99 / throughput / failures`
+更多细节见 [benchmark.md](/home/shamming/projects/myRPC/docs/benchmark.md)。
 
 查看参数：
 
 ```bash
-python3 scripts/bench_python.py --help
 ./build/mrpc_bench_client --help
+python3 bench/run_suite.py --help
 ```
-
-### 如何看结果
-
-输出里重点关注这些指标：
-
-- `QPS`：每秒成功请求数
-- `Latency avg / p50 / p99`：平均延迟与尾延迟
-- `Tx / Rx throughput`：发送和接收吞吐
-- `Failures`：失败请求数
-
-更完整的记录模板见 [benchmark.md](/home/shamming/projects/myRPC/docs/benchmark.md)。
 
 ## Observability
 
@@ -198,46 +249,41 @@ python3 scripts/bench_python.py --help
 - `slow`：超过阈值的慢请求，包含 `queue_ms / handler_ms / io_return_ms / end_to_end_ms`
 - `trace`：失败请求或开启全量 trace 时打印，带 `request_id / method / client / io_thread / connection_id`
 
-## 最新性能结果
+## 当前 Baseline
 
-下面这组数据用于对比服务端从“单线程 IO”升级到“主线程 `accept` + 多 IO 线程”之后的收益。
+当前正式 benchmark 基线保存在：
 
-测试口径：
+- [bench/results/20260422-002612-baseline/report.md](/home/shamming/projects/myRPC/bench/results/20260422-002612-baseline/report.md)
+- [bench/results/20260422-002612-baseline/summary.csv](/home/shamming/projects/myRPC/bench/results/20260422-002612-baseline/summary.csv)
 
-- 日期：`2026-04-11`
-- 测试机器：当前开发环境，`16 vCPU`
+测试环境：
+
+- 日期：`2026-04-22`
+- 测试机器：`WSL2 x86_64`，`16 vCPU`
 - 服务方法：`EchoService.Echo`
-- payload：`hello rpc`，大小 `9 bytes`
-- benchmark client：项目内 `mrpc_bench_client`
-- 压测模式：固定时长 `duration=6s`
-- 每组重复两次，表格内为平均值
+- payload 矩阵：`16 B / 256 B / 4096 B / 16384 B`
+- benchmark duration：`6s`
+- repeats：`3`
 
-对照组：
+本轮结果概览：
 
-- `baseline single-io`：改造前基线版本 `bffdd75`
-- `multi-io(1)`：新架构，但限制为 `1` 个 IO 线程
-- `multi-io(16)`：新架构，使用 `16` 个 IO 线程
+- `8` 个 IO 线程、`50-200` 连接下，吞吐大致稳定在 `48k-50k QPS`
+- `400` 连接时，吞吐下降到约 `45.5k QPS`，`P99` 升到约 `14.7 ms`
+- `IO Threads` 从 `1 -> 8` 时收益明显，`8 -> 16` 时吞吐提升已经很有限
+- payload 从 `16 B` 增长到 `16 KB` 时，QPS 从约 `46.6k` 下降到约 `39.3k`
 
-结果如下：
+这组结果说明当前多 IO 线程架构已经有效，但高连接数场景下尾延迟仍有优化空间。
 
-| Connections | Baseline QPS | Multi-io(1) QPS | Multi-io(16) QPS | Baseline Avg | Multi-io(16) Avg | Baseline P99 | Multi-io(16) P99 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 50 | 13793.31 | 13326.24 | 47594.32 | 3.619 ms | 1.046 ms | 6.209 ms | 3.338 ms |
-| 100 | 13730.40 | 13531.55 | 48179.05 | 7.268 ms | 2.069 ms | 10.128 ms | 5.760 ms |
-| 200 | 13347.12 | 13506.27 | 45729.07 | 14.945 ms | 4.358 ms | 19.569 ms | 10.558 ms |
-| 400 | 13209.30 | 13446.99 | 43754.54 | 30.117 ms | 9.095 ms | 42.678 ms | 18.410 ms |
+## 适合继续优化的方向
 
-从这组结果可以看到：
-
-- 新架构在 `io_thread_count=1` 时与旧版基本持平，说明重构本身没有明显额外开销。
-- 当 `io_thread_count=16` 时，`QPS` 提升约 `2.3x ~ 2.5x`。
-- 平均延迟下降约 `70%`，`P99` 下降约 `43% ~ 57%`。
-- 对当前这种轻业务逻辑、高连接数场景，多 IO 线程模型明显优于单 IO 线程模型。
-
-更完整的测试口径、完整对照表和收益汇总见 [benchmark.md](/home/shamming/projects/myRPC/docs/benchmark.md)。
+- 高连接数下的排队与唤醒路径，重点看 `400` 连接场景的 `P99 / P999`
+- 编解码与缓冲区管理，重点看 `16 KB` payload 场景
+- worker 回投路径和锁竞争，重点看 `8 -> 16` IO 线程时收益变小的问题
+- 后续可补 `perf`、CPU 利用率和 `/metrics` 快照，把 benchmark 和 profiling 串起来
 
 ## 下一步建议
 
 1. 给 `RpcClient` 增加连接池、自动重连和异步调用接口。
-2. 把 `json` serializer 从“轻校验”升级成真正的结构化序列化。
-3. 继续把线程池细化成独立的 IO 线程池和业务线程池。
+2. 把 benchmark suite 和 `/metrics` 快照结合起来，保留每轮性能测试的运行时指标。
+3. 补充更重 handler、异常场景和过载场景下的稳定性测试。
+4. 把 `json` serializer 从“轻校验”升级成真正的结构化序列化。
