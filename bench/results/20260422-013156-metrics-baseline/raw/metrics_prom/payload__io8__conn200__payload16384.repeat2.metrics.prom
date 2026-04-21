@@ -1,0 +1,57 @@
+# TYPE mrpc_uptime_seconds gauge
+mrpc_uptime_seconds 14.526
+# TYPE mrpc_connections_accepted_total counter
+mrpc_connections_accepted_total 601
+# TYPE mrpc_connections_active gauge
+mrpc_connections_active 0
+# TYPE mrpc_requests_total counter
+mrpc_requests_total 498967
+# TYPE mrpc_requests_inflight gauge
+mrpc_requests_inflight 0
+# TYPE mrpc_requests_completed_total counter
+mrpc_requests_completed_total 498967
+# TYPE mrpc_responses_success_total counter
+mrpc_responses_success_total 498967
+# TYPE mrpc_responses_error_total counter
+mrpc_responses_error_total 0
+# TYPE mrpc_responses_timeout_total counter
+mrpc_responses_timeout_total 0
+# TYPE mrpc_responses_overload_total counter
+mrpc_responses_overload_total 0
+# TYPE mrpc_protocol_errors_total counter
+mrpc_protocol_errors_total 0
+# TYPE mrpc_worker_rejections_total counter
+mrpc_worker_rejections_total 0
+# TYPE mrpc_completed_requests_average_qps gauge
+mrpc_completed_requests_average_qps 34349.9
+# TYPE mrpc_latency_queue_average_ms gauge
+mrpc_latency_queue_average_ms 0.0241038
+# TYPE mrpc_latency_queue_max_ms gauge
+mrpc_latency_queue_max_ms 5.348
+# TYPE mrpc_latency_handler_average_ms gauge
+mrpc_latency_handler_average_ms 0.011847
+# TYPE mrpc_latency_handler_max_ms gauge
+mrpc_latency_handler_max_ms 29.504
+# TYPE mrpc_latency_io_return_average_ms gauge
+mrpc_latency_io_return_average_ms 1.18431
+# TYPE mrpc_latency_io_return_max_ms gauge
+mrpc_latency_io_return_max_ms 32.453
+# TYPE mrpc_latency_end_to_end_average_ms gauge
+mrpc_latency_end_to_end_average_ms 1.22858
+# TYPE mrpc_latency_end_to_end_max_ms gauge
+mrpc_latency_end_to_end_max_ms 32.501
+mrpc_method_requests_total{method="EchoService.Echo"} 498967
+mrpc_method_requests_inflight{method="EchoService.Echo"} 0
+mrpc_method_requests_completed_total{method="EchoService.Echo"} 498967
+mrpc_method_responses_success_total{method="EchoService.Echo"} 498967
+mrpc_method_responses_error_total{method="EchoService.Echo"} 0
+mrpc_method_responses_timeout_total{method="EchoService.Echo"} 0
+mrpc_method_responses_overload_total{method="EchoService.Echo"} 0
+mrpc_method_latency_queue_average_ms{method="EchoService.Echo"} 0.0241038
+mrpc_method_latency_queue_max_ms{method="EchoService.Echo"} 5.348
+mrpc_method_latency_handler_average_ms{method="EchoService.Echo"} 0.011847
+mrpc_method_latency_handler_max_ms{method="EchoService.Echo"} 29.504
+mrpc_method_latency_io_return_average_ms{method="EchoService.Echo"} 1.18431
+mrpc_method_latency_io_return_max_ms{method="EchoService.Echo"} 32.453
+mrpc_method_latency_end_to_end_average_ms{method="EchoService.Echo"} 1.22858
+mrpc_method_latency_end_to_end_max_ms{method="EchoService.Echo"} 32.501
