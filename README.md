@@ -203,9 +203,10 @@ python3 bench/run_suite.py --label baseline
 它会自动：
 
 - 为每个 case 启动独立服务端实例
+- 默认开启 admin 端口并抓取 `/metrics`
 - 固定执行 `throughput / io thread scaling / payload scaling` 三组测试
 - 对每个 case 先 warmup，再做 measured repeats
-- 生成 `metadata.json / raw_runs.json / summary.csv / report.md`
+- 生成 `metadata.json / raw_runs.json / metrics_snapshots.json / summary.csv / measurements.csv / plot_series.csv / report.md`
 
 默认矩阵：
 
@@ -219,6 +220,20 @@ python3 bench/run_suite.py --label baseline
 - `IO Threads`：服务端 IO 线程数量，对应 `MRPC_IO_THREADS`
 - `QPS`：每秒成功请求数
 - `P50 / P99 / P999`：中位延迟、尾延迟、极尾延迟
+
+额外导出的结果文件：
+
+- `measurements.csv`：每次 measured run 的扁平化结果，适合直接画图
+- `plot_series.csv`：长表格式绘图输入
+- `method_metrics.csv`：按 `method` 维度导出的指标快照
+- `metrics_snapshots.json`：suite 自动抓取到的 `/metrics`
+- `metrics_timeseries.csv`：压测进行中周期采样得到的时序指标
+
+目录组织约定：
+
+- 顶层结果目录保留 `report / summary / plotting` 等核心产物
+- 原始快照放到 `raw/` 下
+- Prometheus 原始指标文本放到 `raw/metrics_prom/`
 
 推荐流程：
 

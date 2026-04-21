@@ -10,6 +10,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,32 @@ BUILD_DIR = ROOT_DIR / "build"
 DEFAULT_SERVER = BUILD_DIR / "simple_tcp_server"
 DEFAULT_CLIENT = BUILD_DIR / "mrpc_bench_client"
 DEFAULT_RESULTS_DIR = ROOT_DIR / "bench" / "results"
+SUMMARY_METRICS = [
+    "mrpc_connections_active",
+    "mrpc_requests_inflight",
+    "mrpc_completed_requests_average_qps",
+    "mrpc_latency_queue_average_ms",
+    "mrpc_latency_queue_max_ms",
+    "mrpc_latency_handler_average_ms",
+    "mrpc_latency_handler_max_ms",
+    "mrpc_latency_io_return_average_ms",
+    "mrpc_latency_io_return_max_ms",
+    "mrpc_latency_end_to_end_average_ms",
+    "mrpc_latency_end_to_end_max_ms",
+    "mrpc_worker_rejections_total",
+    "mrpc_protocol_errors_total",
+]
+SUMMARY_FIELDS = [
+    "qps_mean",
+    "qps_best",
+    "latency_avg_ms_mean",
+    "latency_p50_ms_mean",
+    "latency_p90_ms_mean",
+    "latency_p99_ms_mean",
+    "latency_p999_ms_mean",
+    "tx_kib_per_s_mean",
+    "rx_kib_per_s_mean",
+]
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -39,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--host", default="127.0.0.1", help="server host")
     parser.add_argument("--port", type=int, default=8080, help="server port")
-    parser.add_argument("--admin-port", type=int, default=0, help="server admin port")
+    parser.add_argument("--admin-port", type=int, default=9090, help="server admin port")
     parser.add_argument(
         "--client",
         default=str(DEFAULT_CLIENT),
@@ -115,6 +142,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="skip checking whether the benchmark binaries exist",
     )
+    parser.add_argument(
+        "--metrics-sample-interval",
+        type=float,
+        default=0.5,
+        help="sample /metrics during warmup and measured runs every N seconds; set to 0 to disable",
+    )
     args = parser.parse_args()
 
     if args.port <= 0 or args.port > 65535:
@@ -131,6 +164,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--baseline-connections must be > 0")
     if args.baseline_io_threads <= 0:
         parser.error("--baseline-io-threads must be > 0")
+    if args.metrics_sample_interval < 0:
+        parser.error("--metrics-sample-interval must be >= 0")
     return args
 
 
@@ -152,6 +187,126 @@ def wait_for_port(host: str, port: int, timeout: float) -> None:
             except OSError:
                 time.sleep(0.1)
     raise TimeoutError(f"timed out waiting for {host}:{port} to accept connections")
+
+
+def http_get(host: str, port: int, path: str, timeout: float = 2.0) -> str:
+    request = (
+        f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+    ).encode("ascii")
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall(request)
+        response = bytearray()
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+    header_bytes, _, body = bytes(response).partition(b"\r\n\r\n")
+    status_line = header_bytes.splitlines()[0].decode("ascii", errors="replace")
+    if " 200 " not in status_line:
+        raise RuntimeError(f"unexpected admin response status: {status_line}")
+    return body.decode("utf-8")
+
+
+def parse_labels(raw: str) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    if not raw:
+        return labels
+    for item in raw.split(","):
+        key, value = item.split("=", 1)
+        value = value.strip()
+        if value.startswith('"') and value.endswith('"'):
+            value = value[1:-1]
+        value = value.replace('\\"', '"').replace("\\\\", "\\").replace("\\n", "\n")
+        labels[key.strip()] = value
+    return labels
+
+
+def parse_metrics_text(text: str) -> tuple[dict[str, float], list[dict[str, Any]]]:
+    scalars: dict[str, float] = {}
+    labeled: list[dict[str, Any]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        metric_with_labels, value_text = line.split(None, 1)
+        if "{" in metric_with_labels:
+            metric_name, raw_labels = metric_with_labels.split("{", 1)
+            labels = parse_labels(raw_labels.rstrip("}"))
+            labeled.append(
+                {
+                    "metric_name": metric_name,
+                    "labels": labels,
+                    "value": float(value_text),
+                }
+            )
+        else:
+            scalars[metric_with_labels] = float(value_text)
+    return scalars, labeled
+
+
+class MetricsSampler:
+    def __init__(self, host: str, port: int, interval_seconds: float) -> None:
+        self.host = host
+        self.port = port
+        self.interval_seconds = interval_seconds
+        self.stop_event = threading.Event()
+        self.state_lock = threading.Lock()
+        self.stage = "idle"
+        self.repeat = 0
+        self.case_id = ""
+        self.case_kind = ""
+        self.samples: list[dict[str, Any]] = []
+        self.errors: list[str] = []
+        self.thread = threading.Thread(target=self._run, name="metrics-sampler", daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def switch_case(self, case_id: str, case_kind: str) -> None:
+        with self.state_lock:
+            self.case_id = case_id
+            self.case_kind = case_kind
+            self.stage = "idle"
+            self.repeat = 0
+
+    def set_stage(self, stage: str, repeat: int) -> None:
+        with self.state_lock:
+            self.stage = stage
+            self.repeat = repeat
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=max(1.0, self.interval_seconds + 1.0))
+
+    def _snapshot_state(self) -> tuple[str, str, str, int]:
+        with self.state_lock:
+            return self.case_id, self.case_kind, self.stage, self.repeat
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(self.interval_seconds):
+            case_id, case_kind, stage, repeat = self._snapshot_state()
+            if not case_id or stage == "idle":
+                continue
+            try:
+                metrics_text = http_get(self.host, self.port, "/metrics")
+                scalars, labeled = parse_metrics_text(metrics_text)
+                self.samples.append(
+                    {
+                        "sample_timestamp": dt.datetime.now().isoformat(timespec="milliseconds"),
+                        "case_id": case_id,
+                        "case_kind": case_kind,
+                        "stage": stage,
+                        "repeat": repeat,
+                        "scalars": scalars,
+                        "labeled": labeled,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.errors.append(
+                    f"{dt.datetime.now().isoformat(timespec='seconds')} {case_id} {stage}#{repeat}: {exc}"
+                )
 
 
 def build_payload(size: int) -> str:
@@ -234,6 +389,8 @@ def launch_server(
     )
     try:
         wait_for_port(host, port, timeout=10.0)
+        if admin_port != 0:
+            wait_for_port(host, admin_port, timeout=10.0)
     except Exception:
         process.terminate()
         try:
@@ -340,6 +497,22 @@ def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
+def summarize_metric_snapshots(metric_snapshots: list[dict[str, Any]]) -> dict[str, float]:
+    if not metric_snapshots:
+        return {}
+    summary: dict[str, float] = {}
+    for metric_name in SUMMARY_METRICS:
+        values = [
+            float(snapshot["scalars"][metric_name])
+            for snapshot in metric_snapshots
+            if metric_name in snapshot["scalars"]
+        ]
+        if values:
+            summary[f"{metric_name}_mean"] = statistics.fmean(values)
+            summary[f"{metric_name}_max"] = max(values)
+    return summary
+
+
 def load_previous_summary(csv_path: Path) -> dict[str, dict[str, str]]:
     previous: dict[str, dict[str, str]] = {}
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
@@ -355,12 +528,162 @@ def write_json(path: Path, data: Any) -> None:
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
-    fieldnames = list(rows[0].keys())
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                fieldnames.append(key)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def build_measurement_rows(raw_runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for run in raw_runs:
+        row: dict[str, Any] = {
+            "case_id": run["case_id"],
+            "case_kind": run["case_kind"],
+            "repeat": run["repeat"],
+            "io_threads": run["io_threads"],
+            "connections": run["connections"],
+            "payload_size_bytes": run["payload_size_bytes"],
+            "qps": run["qps"],
+            "latency_avg_ms": run["latency_ms"]["avg"],
+            "latency_p50_ms": run["latency_ms"]["p50"],
+            "latency_p90_ms": run["latency_ms"]["p90"],
+            "latency_p99_ms": run["latency_ms"]["p99"],
+            "latency_p999_ms": run["latency_ms"]["p999"],
+            "latency_max_ms": run["latency_ms"]["max"],
+            "tx_kib_per_s": run["tx_kib_per_s"],
+            "rx_kib_per_s": run["rx_kib_per_s"],
+        }
+        for metric_name in SUMMARY_METRICS:
+            row[metric_name] = run.get("metrics_scalars", {}).get(metric_name, "")
+        rows.append(row)
+    return rows
+
+
+def build_method_metric_rows(metric_snapshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for snapshot in metric_snapshots:
+        for metric in snapshot["labeled"]:
+            method = metric["labels"].get("method")
+            if method is None:
+                continue
+            rows.append(
+                {
+                    "case_id": snapshot["case_id"],
+                    "case_kind": snapshot["case_kind"],
+                    "stage": snapshot["stage"],
+                    "repeat": snapshot["repeat"],
+                    "metric_name": metric["metric_name"],
+                    "method": method,
+                    "value": metric["value"],
+                }
+            )
+    return rows
+
+
+def build_metrics_timeseries_rows(metric_snapshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for snapshot in metric_snapshots:
+        timestamp = snapshot.get("sample_timestamp", "")
+        for metric_name, value in snapshot["scalars"].items():
+            rows.append(
+                {
+                    "sample_timestamp": timestamp,
+                    "case_id": snapshot["case_id"],
+                    "case_kind": snapshot["case_kind"],
+                    "stage": snapshot["stage"],
+                    "repeat": snapshot["repeat"],
+                    "metric_name": metric_name,
+                    "value": value,
+                }
+            )
+        for metric in snapshot["labeled"]:
+            rows.append(
+                {
+                    "sample_timestamp": timestamp,
+                    "case_id": snapshot["case_id"],
+                    "case_kind": snapshot["case_kind"],
+                    "stage": snapshot["stage"],
+                    "repeat": snapshot["repeat"],
+                    "metric_name": metric["metric_name"],
+                    "value": metric["value"],
+                    **{f"label_{key}": label_value for key, label_value in metric["labels"].items()},
+                }
+            )
+    return rows
+
+
+def build_plot_rows(summary_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in summary_rows:
+        x_axis = (
+            "connections"
+            if row["case_kind"] == "throughput"
+            else "io_threads"
+            if row["case_kind"] == "thread_scale"
+            else "payload_size_bytes"
+        )
+        x_value = row["connections"] if x_axis == "connections" else row["io_threads"] if x_axis == "io_threads" else row["payload_size_bytes"]
+        for metric_name in SUMMARY_FIELDS:
+            rows.append(
+                {
+                    "case_id": row["case_id"],
+                    "case_kind": row["case_kind"],
+                    "x_axis": x_axis,
+                    "x_value": x_value,
+                    "metric_name": metric_name,
+                    "value": row[metric_name],
+                }
+            )
+        for metric_name in SUMMARY_METRICS:
+            mean_key = f"{metric_name}_mean"
+            if mean_key in row:
+                rows.append(
+                    {
+                        "case_id": row["case_id"],
+                        "case_kind": row["case_kind"],
+                        "x_axis": x_axis,
+                        "x_value": x_value,
+                        "metric_name": mean_key,
+                        "value": row[mean_key],
+                    }
+                )
+    return rows
+
+
+def build_comparison_rows(
+    summary_rows: list[dict[str, Any]], previous_summary: dict[str, dict[str, str]]
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in summary_rows:
+        previous = previous_summary.get(row["case_id"])
+        if previous is None:
+            continue
+        comparison_row: dict[str, Any] = {
+            "case_id": row["case_id"],
+            "case_kind": row["case_kind"],
+            "io_threads": row["io_threads"],
+            "connections": row["connections"],
+            "payload_size_bytes": row["payload_size_bytes"],
+        }
+        for metric_name in ["qps_mean", "latency_avg_ms_mean", "latency_p99_ms_mean", "latency_p999_ms_mean"]:
+            current = float(row[metric_name])
+            previous_value = float(previous[metric_name])
+            comparison_row[f"{metric_name}_current"] = current
+            comparison_row[f"{metric_name}_previous"] = previous_value
+            comparison_row[f"{metric_name}_delta_pct"] = (
+                ((current - previous_value) / previous_value) * 100.0 if previous_value != 0 else ""
+            )
+        rows.append(comparison_row)
+    return rows
 
 
 def render_table(headers: list[str], rows: list[list[str]]) -> str:
@@ -510,6 +833,12 @@ def main() -> int:
         else DEFAULT_RESULTS_DIR / f"{timestamp}{label_suffix}"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = output_dir / "raw"
+    metrics_prom_dir = raw_dir / "metrics_prom"
+    server_logs_dir = raw_dir / "server_logs"
+    raw_dir.mkdir(exist_ok=True)
+    metrics_prom_dir.mkdir(exist_ok=True)
+    server_logs_dir.mkdir(exist_ok=True)
 
     previous_summary: dict[str, dict[str, str]] = {}
     if args.compare_with:
@@ -527,10 +856,12 @@ def main() -> int:
         "host": args.host,
         "port": args.port,
         "admin_port": args.admin_port,
+        "metrics_sample_interval_seconds": args.metrics_sample_interval,
     }
 
     raw_runs: list[dict[str, Any]] = []
     summary_rows: list[dict[str, Any]] = []
+    metric_snapshots: list[dict[str, Any]] = []
 
     cases: list[dict[str, Any]] = []
     for connections in args.connections:
@@ -568,7 +899,7 @@ def main() -> int:
             case["connections"],
             case["payload_size_bytes"],
         )
-        server_log = output_dir / f"{cid}.server.log"
+        server_log = server_logs_dir / f"{cid}.server.log"
         payload = build_payload(case["payload_size_bytes"])
         print(
             f"[bench] {cid}: io_threads={case['io_threads']} "
@@ -584,11 +915,18 @@ def main() -> int:
             io_threads=case["io_threads"],
             log_path=server_log,
         )
+        sampler = None
+        if args.admin_port != 0 and args.metrics_sample_interval > 0:
+            sampler = MetricsSampler(args.host, args.admin_port, args.metrics_sample_interval)
+            sampler.switch_case(cid, case["case_kind"])
+            sampler.start()
 
         runs: list[dict[str, Any]] = []
         case_succeeded = False
         try:
             if args.warmup > 0:
+                if sampler is not None:
+                    sampler.set_stage("warmup", 0)
                 run_client(
                     client_path=client_path,
                     host=args.host,
@@ -598,8 +936,31 @@ def main() -> int:
                     duration=args.warmup,
                     payload=payload,
                 )
+                if sampler is not None:
+                    sampler.set_stage("idle", 0)
+                if args.admin_port != 0:
+                    metrics_text = http_get(args.host, args.admin_port, "/metrics")
+                    (metrics_prom_dir / f"{cid}.warmup.metrics.prom").write_text(
+                        metrics_text, encoding="utf-8"
+                    )
+                    scalars, labeled = parse_metrics_text(metrics_text)
+                    metric_snapshots.append(
+                        {
+                            "sample_timestamp": dt.datetime.now().isoformat(
+                                timespec="milliseconds"
+                            ),
+                            "case_id": cid,
+                            "case_kind": case["case_kind"],
+                            "stage": "warmup",
+                            "repeat": 0,
+                            "scalars": scalars,
+                            "labeled": labeled,
+                        }
+                    )
 
             for repeat in range(1, args.repeats + 1):
+                if sampler is not None:
+                    sampler.set_stage("repeat", repeat)
                 run = run_client(
                     client_path=client_path,
                     host=args.host,
@@ -609,15 +970,45 @@ def main() -> int:
                     duration=args.duration,
                     payload=payload,
                 )
+                if sampler is not None:
+                    sampler.set_stage("idle", repeat)
                 run["repeat"] = repeat
                 run["case_id"] = cid
                 run["case_kind"] = case["case_kind"]
                 run["io_threads"] = case["io_threads"]
                 run["connections"] = case["connections"]
+                run["payload_size_bytes"] = case["payload_size_bytes"]
+                if args.admin_port != 0:
+                    metrics_text = http_get(args.host, args.admin_port, "/metrics")
+                    (metrics_prom_dir / f"{cid}.repeat{repeat}.metrics.prom").write_text(
+                        metrics_text, encoding="utf-8"
+                    )
+                    scalars, labeled = parse_metrics_text(metrics_text)
+                    run["metrics_scalars"] = scalars
+                    metric_snapshots.append(
+                        {
+                            "sample_timestamp": dt.datetime.now().isoformat(
+                                timespec="milliseconds"
+                            ),
+                            "case_id": cid,
+                            "case_kind": case["case_kind"],
+                            "stage": "repeat",
+                            "repeat": repeat,
+                            "scalars": scalars,
+                            "labeled": labeled,
+                        }
+                    )
                 raw_runs.append(run)
                 runs.append(run)
             case_succeeded = True
         finally:
+            if sampler is not None:
+                sampler.stop()
+                metric_snapshots.extend(sampler.samples)
+                if sampler.errors:
+                    (raw_dir / f"{cid}.metrics_sampler_errors.log").write_text(
+                        "\n".join(sampler.errors) + "\n", encoding="utf-8"
+                    )
             stop_server(server)
             if not args.keep_server_logs and case_succeeded and server_log.exists():
                 server_log.unlink()
@@ -631,13 +1022,26 @@ def main() -> int:
             "payload_size_bytes": case["payload_size_bytes"],
             **summary,
         }
+        case_metric_snapshots = [
+            snapshot
+            for snapshot in metric_snapshots
+            if snapshot["case_id"] == cid and snapshot["stage"] == "repeat"
+        ]
+        row.update(summarize_metric_snapshots(case_metric_snapshots))
         summary_rows.append(row)
 
     summary_rows.sort(key=lambda row: (row["case_kind"], row["io_threads"], row["connections"], row["payload_size_bytes"]))
 
     write_json(output_dir / "metadata.json", metadata)
-    write_json(output_dir / "raw_runs.json", raw_runs)
+    write_json(raw_dir / "raw_runs.json", raw_runs)
+    write_json(raw_dir / "metrics_snapshots.json", metric_snapshots)
     write_csv(output_dir / "summary.csv", summary_rows)
+    write_csv(output_dir / "measurements.csv", build_measurement_rows(raw_runs))
+    write_csv(output_dir / "method_metrics.csv", build_method_metric_rows(metric_snapshots))
+    write_csv(output_dir / "metrics_timeseries.csv", build_metrics_timeseries_rows(metric_snapshots))
+    write_csv(output_dir / "plot_series.csv", build_plot_rows(summary_rows))
+    if previous_summary:
+        write_csv(output_dir / "comparison.csv", build_comparison_rows(summary_rows, previous_summary))
     report = build_markdown_report(args, metadata, summary_rows, previous_summary)
     (output_dir / "report.md").write_text(report, encoding="utf-8")
 

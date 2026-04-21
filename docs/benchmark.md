@@ -47,9 +47,10 @@ python3 bench/run_suite.py --label observability-baseline
 这条命令会自动：
 
 - 为每个 case 启动独立服务端实例
+- 默认开启 admin 端口并自动抓取 `/metrics`
 - 固定使用同一套 `throughput / io thread scaling / payload scaling` 矩阵
 - 每个 case 先跑 warmup，再跑多次 measured repeats
-- 生成 `metadata.json / raw_runs.json / summary.csv / report.md`
+- 生成 `metadata.json / raw_runs.json / metrics_snapshots.json / summary.csv / measurements.csv / plot_series.csv / report.md`
 
 默认矩阵如下：
 
@@ -61,6 +62,8 @@ python3 bench/run_suite.py --label observability-baseline
 
 - `--duration 6 --warmup 2 --repeats 3`：控制每个 case 的测试时长和重复次数
 - `--baseline-io-threads 8`：设置默认基线 IO 线程数
+- `--admin-port 9090`：开启管理端口并抓取 `/metrics`，设置为 `0` 可关闭
+- `--metrics-sample-interval 0.5`：压测进行中每隔多少秒抓一次 `/metrics`，设置为 `0` 可关闭周期采样
 - `--compare-with bench/results/<old>/summary.csv`：和上一次报告做前后对比
 - `--output-dir bench/results/<name>`：自定义结果输出目录
 
@@ -117,11 +120,17 @@ python3 bench/run_suite.py --label observability-baseline
 `bench/run_suite.py` 会自动生成：
 
 - `metadata.json`：测试环境、commit、参数
-- `raw_runs.json`：每次 measured run 的原始结果
+- `raw/raw_runs.json`：每次 measured run 的原始结果
 - `summary.csv`：按 case 聚合后的机器可读汇总
+- `measurements.csv`：每次 measured run 的平铺结果，适合直接画图
+- `plot_series.csv`：长表格式的绘图输入
+- `method_metrics.csv`：按 `method` 维度导出的指标快照
+- `raw/metrics_snapshots.json`：每个 case warmup / repeat 后抓取到的 `/metrics`
+- `metrics_timeseries.csv`：压测进行中周期采样得到的时序指标，适合画运行中曲线
+- `raw/metrics_prom/`：每个 case 每个阶段保存的 Prometheus 原始文本快照
 - `report.md`：适合提交到仓库的 Markdown 报告
 
-可以把 `report.md` 直接 copy 到 `bench/results/<timestamp>/` 下长期归档。
+建议把顶层目录当作“主要结果入口”，需要排查细节时再进入 `raw/` 查看原始快照。
 
 ## 说明
 
