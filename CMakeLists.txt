@@ -20,6 +20,7 @@ add_executable(simple_tcp_server
     src/codec/rpc_codec.cpp
     src/codec/rpc_serialization.cpp
     src/dispatcher/rpc_dispatcher.cpp
+    src/observability/observability.cpp
     src/server/server.cpp
     src/server/socket_utils.cpp
     src/worker/worker_pool.cpp

@@ -29,6 +29,11 @@ struct RpcRequest {
     RpcSerializationType serialization = RpcSerializationType::kRaw;
     uint32_t timeout_ms = 0;
     std::chrono::steady_clock::time_point received_at = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point enqueued_at = received_at;
+    std::chrono::steady_clock::time_point worker_started_at = received_at;
+    uint64_t connection_id = 0;
+    size_t io_thread_index = 0;
+    std::string client_label;
 };
 
 struct RpcResponse {

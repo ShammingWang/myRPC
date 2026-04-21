@@ -50,6 +50,7 @@ rpc-project/
 - 空闲连接回收与请求超时处理
 - 可插拔序列化元数据，内置 `raw` 和 `json`
 - 更细的错误码体系，区分协议、序列化、超时和网络错误
+- 内建 observability：周期性 metrics、slow log、request trace
 
 ## 构建
 
@@ -65,6 +66,14 @@ cmake --build build
 ```
 
 默认监听 `0.0.0.0:8080`。
+
+可选环境变量：
+
+- `MRPC_IO_THREADS`：指定 IO 线程数
+- `MRPC_ADMIN_PORT`：管理 HTTP 端口，默认 `9090`，设置为 `0` 可关闭
+- `MRPC_SLOW_REQUEST_MS`：慢请求阈值，默认 `50`
+- `MRPC_ENABLE_REQUEST_TRACE`：是否开启 request trace，默认 `true`
+- `MRPC_TRACE_ALL_REQUESTS`：是否打印所有请求 trace，默认 `false`
 
 ## 协议格式
 
@@ -180,6 +189,14 @@ python3 scripts/bench_python.py --help
 - `Failures`：失败请求数
 
 更完整的记录模板见 [benchmark.md](/home/shamming/projects/myRPC/docs/benchmark.md)。
+
+## Observability
+
+服务端现在会输出三类观测日志：
+
+- `/metrics`：独立 HTTP 管理端口导出当前连接、请求、错误、超时等指标
+- `slow`：超过阈值的慢请求，包含 `queue_ms / handler_ms / io_return_ms / end_to_end_ms`
+- `trace`：失败请求或开启全量 trace 时打印，带 `request_id / method / client / io_thread / connection_id`
 
 ## 最新性能结果
 

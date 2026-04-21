@@ -38,8 +38,14 @@ volatile std::sig_atomic_t g_running = 1;
 
 Server::Server(uint16_t port, ServerOptions options)
     : port_(port),
+      admin_port_(options.admin_port),
       options_(options),
-      worker_pool_(std::max(1u, std::thread::hardware_concurrency())) {}
+      worker_pool_(std::max(1u, std::thread::hardware_concurrency())),
+      observability_(std::make_shared<Observability>(ObservabilityOptions{
+          options_.slow_request_threshold,
+          options_.enable_request_trace,
+          options_.trace_all_requests,
+      })) {}
 
 void Server::RegisterMethod(std::string service, std::string method,
                             RpcDispatcher::MethodHandler handler) {
@@ -69,6 +75,11 @@ bool Server::Start() {
     }
 
     if (!StartIoThreads()) {
+        Stop();
+        return false;
+    }
+
+    if (!StartAdminServer()) {
         Stop();
         return false;
     }
@@ -107,8 +118,17 @@ void Server::Stop() {
         listen_fd_ = -1;
     }
 
+    if (admin_listen_fd_ >= 0) {
+        ::close(admin_listen_fd_);
+        admin_listen_fd_ = -1;
+    }
+
     for (const auto& io_thread : io_threads_) {
         WakeIoThread(*io_thread);
+    }
+
+    if (admin_thread_.joinable()) {
+        admin_thread_.join();
     }
 
     for (const auto& io_thread : io_threads_) {
@@ -211,6 +231,23 @@ bool Server::InitIoThread(IoThreadState& io_thread) {
     return true;
 }
 
+bool Server::StartAdminServer() {
+    if (admin_port_ == 0) {
+        return true;
+    }
+
+    admin_listen_fd_ = CreateListenSocket(admin_port_);
+    if (admin_listen_fd_ < 0) {
+        return false;
+    }
+    if (!SetNonBlocking(admin_listen_fd_)) {
+        return false;
+    }
+
+    admin_thread_ = std::thread(&Server::RunAdminThread, this);
+    return true;
+}
+
 void Server::RunIoThread(size_t io_thread_index) {
     IoThreadState& io_thread = *io_threads_[io_thread_index];
     epoll_event events[kMaxEvents];
@@ -279,6 +316,79 @@ void Server::RunIoThread(size_t io_thread_index) {
         const int conn_fd = it->first;
         ++it;
         CloseConnection(io_thread, conn_fd);
+    }
+}
+
+void Server::RunAdminThread() {
+    while (!stopping_) {
+        sockaddr_in client_addr{};
+        socklen_t client_len = sizeof(client_addr);
+        const int client_fd =
+            ::accept(admin_listen_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+        if (client_fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            if (stopping_) {
+                return;
+            }
+            std::cerr << "admin accept failed: " << std::strerror(errno) << '\n';
+            continue;
+        }
+
+        HandleAdminClient(client_fd);
+        ::close(client_fd);
+    }
+}
+
+void Server::HandleAdminClient(int client_fd) {
+    std::string request_buffer;
+    request_buffer.reserve(1024);
+
+    char buffer[1024];
+    while (request_buffer.find("\r\n\r\n") == std::string::npos) {
+        const ssize_t n = ::recv(client_fd, buffer, sizeof(buffer), 0);
+        if (n == 0) {
+            return;
+        }
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return;
+        }
+        request_buffer.append(buffer, static_cast<size_t>(n));
+        if (request_buffer.size() > 8192) {
+            break;
+        }
+    }
+
+    const bool is_metrics_request =
+        request_buffer.rfind("GET /metrics ", 0) == 0 ||
+        request_buffer.rfind("GET /metrics?", 0) == 0;
+    const std::string body =
+        is_metrics_request ? observability_->ExportMetrics() : "not found\n";
+    const std::string status_line =
+        is_metrics_request ? "HTTP/1.1 200 OK\r\n" : "HTTP/1.1 404 Not Found\r\n";
+    const std::string headers =
+        "Content-Type: text/plain; version=0.0.4\r\nContent-Length: " +
+        std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
+    const std::string response = status_line + headers + body;
+
+    size_t sent = 0;
+    while (sent < response.size()) {
+        const ssize_t n = ::send(client_fd, response.data() + sent, response.size() - sent, 0);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return;
+        }
+        sent += static_cast<size_t>(n);
     }
 }
 
@@ -371,18 +481,23 @@ void Server::DispatchRequest(size_t io_thread_index, int conn_fd, uint64_t conne
         response.serialization = request.serialization;
         response.status_code = RpcStatusCode::kServerOverloaded;
         response.payload = "server is stopping";
-        EnqueueResponse(io_thread_index, conn_fd, connection_id, std::move(response));
+        EnqueueResponse(io_thread_index, conn_fd, connection_id, std::move(request),
+                        std::move(response), std::chrono::steady_clock::now());
         return;
     }
 
     const uint64_t request_id = request.request_id;
     const RpcSerializationType serialization = request.serialization;
+    request.enqueued_at = std::chrono::steady_clock::now();
+    observability_->OnRequestDispatched();
     const bool submitted =
         worker_pool_.Submit([this, io_thread_index, conn_fd, connection_id,
                              request = std::move(request)]() mutable {
+            request.worker_started_at = std::chrono::steady_clock::now();
             if (IsRequestTimedOut(request, std::chrono::steady_clock::now())) {
                 EnqueueResponse(io_thread_index, conn_fd, connection_id,
-                                BuildTimeoutResponse(request));
+                                std::move(request), BuildTimeoutResponse(request),
+                                std::chrono::steady_clock::now());
                 return;
             }
 
@@ -391,21 +506,25 @@ void Server::DispatchRequest(size_t io_thread_index, int conn_fd, uint64_t conne
                 IsRequestTimedOut(request, std::chrono::steady_clock::now())) {
                 response = BuildTimeoutResponse(request);
             }
-            EnqueueResponse(io_thread_index, conn_fd, connection_id, std::move(response));
+            EnqueueResponse(io_thread_index, conn_fd, connection_id, std::move(request),
+                            std::move(response), std::chrono::steady_clock::now());
         });
 
     if (!submitted) {
+        observability_->OnWorkerPoolRejected();
         RpcResponse response;
         response.request_id = request_id;
         response.serialization = serialization;
         response.status_code = RpcStatusCode::kServerOverloaded;
         response.payload = "worker pool unavailable";
-        EnqueueResponse(io_thread_index, conn_fd, connection_id, std::move(response));
+        EnqueueResponse(io_thread_index, conn_fd, connection_id, std::move(request),
+                        std::move(response), std::chrono::steady_clock::now());
     }
 }
 
 void Server::EnqueueResponse(size_t io_thread_index, int conn_fd, uint64_t connection_id,
-                             RpcResponse response) {
+                             RpcRequest request, RpcResponse response,
+                             std::chrono::steady_clock::time_point worker_finished_at) {
     if (stopping_ || io_thread_index >= io_threads_.size()) {
         return;
     }
@@ -413,8 +532,9 @@ void Server::EnqueueResponse(size_t io_thread_index, int conn_fd, uint64_t conne
     IoThreadState& io_thread = *io_threads_[io_thread_index];
     {
         std::lock_guard<std::mutex> lock(io_thread.mutex);
-        io_thread.completed_responses.push(
-            PendingResponse{io_thread_index, conn_fd, connection_id, std::move(response)});
+        io_thread.completed_responses.push(PendingResponse{
+            io_thread_index, conn_fd, connection_id, std::move(request), std::move(response),
+            worker_finished_at, std::chrono::steady_clock::now()});
     }
     WakeIoThread(io_thread);
 }
@@ -463,7 +583,10 @@ void Server::DrainAcceptedConnections(IoThreadState& io_thread,
                 DispatchRequest(io_thread_index, conn_fd, connection_id, std::move(request));
             },
             ConnectionOptions{options_.max_pending_requests_per_connection,
-                              options_.max_outbound_buffer_bytes_per_connection});
+                              options_.max_outbound_buffer_bytes_per_connection,
+                              io_thread.index,
+                              accepted.connection_id,
+                              observability_});
 
         epoll_event event{};
         event.events = BuildConnectionEvents(connection);
@@ -499,6 +622,9 @@ void Server::DrainCompletedResponses(IoThreadState& io_thread,
             CloseConnection(io_thread, pending.conn_fd);
             continue;
         }
+        observability_->OnResponseSent(
+            pending.request, pending.response, pending.worker_finished_at,
+            pending.response_enqueued_at, std::chrono::steady_clock::now());
         if (it->second.connection.ShouldClose()) {
             CloseConnection(io_thread, pending.conn_fd);
             continue;

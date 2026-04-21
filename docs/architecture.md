@@ -5,7 +5,7 @@
 ## 分层
 
 - `src/server/`
-  负责监听端口、主线程 `accept`、多 IO 线程事件循环、响应回投和连接生命周期管理。
+  负责监听端口、主线程 `accept`、多 IO 线程事件循环、响应回投、管理端口和连接生命周期管理。
 - `src/connection/`
   维护单个 TCP 连接的读缓冲、写缓冲、请求解析和连接关闭状态。
 - `src/codec/`
@@ -16,6 +16,8 @@
   提供业务执行线程池，避免 handler 阻塞 IO 线程。
 - `src/client/`
   提供正式 RPC client，负责连接管理、请求发送、响应匹配与超时控制。
+- `src/observability/`
+  提供 metrics、slow log 和 request trace，帮助做性能定位与问题排查。
 
 ## 请求流转
 
@@ -27,6 +29,7 @@
 6. `RpcDispatcher` 按 `Service.Method` 查找并执行 handler。
 7. 业务线程产出 `RpcResponse` 后，经目标 IO 线程的 `eventfd` 唤醒对应 reactor。
 8. `Connection` 将响应编码后写回客户端。
+9. `Observability` 汇总请求队列时间、handler 执行时间、响应回投时间和端到端时延，并按条件输出 `slow / trace`，同时通过独立 HTTP 管理端口暴露 `/metrics`。
 
 ## 当前特征
 
@@ -36,4 +39,5 @@
 - 连接级背压：限制 in-flight 请求数与写缓冲大小
 - 服务端支持空闲连接清理和请求超时处理
 - 客户端支持同步调用、响应匹配和超时等待
+- 服务端内建 `/metrics`、slow log 和 request trace
 - 当前仍是单节点运行时，不包含注册中心、服务发现和治理能力

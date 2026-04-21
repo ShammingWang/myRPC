@@ -2,14 +2,19 @@
 
 #include <chrono>
 #include <functional>
+#include <memory>
 #include <string>
 
 #include "codec/rpc_codec.h"
 #include "codec/rpc_message.h"
+#include "observability/observability.h"
 
 struct ConnectionOptions {
     size_t max_pending_requests = 1024;
     size_t max_outbound_buffer_bytes = 1024 * 1024;
+    size_t io_thread_index = 0;
+    uint64_t connection_id = 0;
+    std::shared_ptr<Observability> observability;
 };
 
 class Connection {
