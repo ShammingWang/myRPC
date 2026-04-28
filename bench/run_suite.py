@@ -101,8 +101,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--payload-sizes",
         type=parse_int_list,
-        default=parse_int_list("16,256,4096,16384"),
+        default=parse_int_list("16,256,4096,16384,65536"),
         help="payload sizes in bytes for the payload sweep",
+    )
+    parser.add_argument(
+        "--outstanding-per-connection",
+        type=parse_int_list,
+        default=parse_int_list("1,4,16,64"),
+        help="per-connection pipelined request depths for the single-connection multiplexing sweep",
     )
     parser.add_argument(
         "--baseline-connections",
@@ -168,6 +174,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--baseline-connections must be > 0")
     if args.baseline_io_threads <= 0:
         parser.error("--baseline-io-threads must be > 0")
+    if any(value <= 0 for value in args.outstanding_per_connection):
+        parser.error("--outstanding-per-connection values must be > 0")
     if args.metrics_sample_interval < 0:
         parser.error("--metrics-sample-interval must be >= 0")
     return args
@@ -362,8 +370,21 @@ def sanitize_name(value: str) -> str:
     return "".join(safe).strip("_") or "benchmark"
 
 
-def case_id(kind: str, io_threads: int, connections: int, payload_size: int) -> str:
-    return f"{kind}__io{io_threads}__conn{connections}__payload{payload_size}"
+def case_id(
+    kind: str,
+    io_threads: int,
+    connections: int,
+    payload_size: int,
+    outstanding_per_connection: int,
+    reconnect_per_request: bool,
+    method: str,
+) -> str:
+    reconnect = "reconnect" if reconnect_per_request else "reuse"
+    method_name = sanitize_name(method)
+    return (
+        f"{kind}__io{io_threads}__conn{connections}__payload{payload_size}"
+        f"__out{outstanding_per_connection}__{reconnect}__{method_name}"
+    )
 
 
 def launch_server(
@@ -433,6 +454,8 @@ def run_client(
     connections: int,
     duration: float,
     payload: str,
+    outstanding_per_connection: int,
+    reconnect_per_request: bool,
 ) -> dict[str, Any]:
     command = [
         str(client_path),
@@ -450,9 +473,13 @@ def run_client(
         payload,
         "--expect-payload",
         payload,
+        "--outstanding-per-connection",
+        str(outstanding_per_connection),
         "--report-format",
         "json",
     ]
+    if reconnect_per_request:
+        command.append("--reconnect-per-request")
     result = subprocess.run(
         command,
         cwd=ROOT_DIR,
@@ -553,9 +580,12 @@ def build_measurement_rows(raw_runs: list[dict[str, Any]]) -> list[dict[str, Any
             "case_id": run["case_id"],
             "case_kind": run["case_kind"],
             "repeat": run["repeat"],
+            "method": run["method"],
             "io_threads": run["io_threads"],
             "connections": run["connections"],
             "payload_size_bytes": run["payload_size_bytes"],
+            "outstanding_per_connection": run["outstanding_per_connection"],
+            "reconnect_per_request": run["reconnect_per_request"],
             "qps": run["qps"],
             "latency_avg_ms": run["latency_ms"]["avg"],
             "latency_p50_ms": run["latency_ms"]["p50"],
@@ -633,9 +663,19 @@ def build_plot_rows(summary_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if row["case_kind"] == "throughput"
             else "io_threads"
             if row["case_kind"] == "thread_scale"
+            else "outstanding_per_connection"
+            if row["case_kind"] == "multiplex"
             else "payload_size_bytes"
         )
-        x_value = row["connections"] if x_axis == "connections" else row["io_threads"] if x_axis == "io_threads" else row["payload_size_bytes"]
+        x_value = (
+            row["connections"]
+            if x_axis == "connections"
+            else row["io_threads"]
+            if x_axis == "io_threads"
+            else row["outstanding_per_connection"]
+            if x_axis == "outstanding_per_connection"
+            else row["payload_size_bytes"]
+        )
         for metric_name in SUMMARY_FIELDS:
             rows.append(
                 {
@@ -677,6 +717,9 @@ def build_comparison_rows(
             "io_threads": row["io_threads"],
             "connections": row["connections"],
             "payload_size_bytes": row["payload_size_bytes"],
+            "outstanding_per_connection": row["outstanding_per_connection"],
+            "reconnect_per_request": row["reconnect_per_request"],
+            "method": row["method"],
         }
         for metric_name in ["qps_mean", "latency_avg_ms_mean", "latency_p99_ms_mean", "latency_p999_ms_mean"]:
             current = float(row[metric_name])
@@ -719,7 +762,14 @@ def build_markdown_report(
     rows: list[dict[str, Any]],
     previous_summary: dict[str, dict[str, str]],
 ) -> str:
-    by_kind: dict[str, list[dict[str, Any]]] = {"throughput": [], "thread_scale": [], "payload": []}
+    by_kind: dict[str, list[dict[str, Any]]] = {
+        "throughput": [],
+        "thread_scale": [],
+        "payload": [],
+        "multiplex": [],
+        "connection_mode": [],
+        "handler": [],
+    }
     for row in rows:
         by_kind[row["case_kind"]].append(row)
 
@@ -812,6 +862,62 @@ def build_markdown_report(
             ],
         ),
         "",
+        "## Single Connection Multiplexing",
+        "",
+        render_table(
+            ["Outstanding", "IO Threads", "Connections", "Payload", "QPS", "P50", "P99", "P999"],
+            [
+                [
+                    str(row["outstanding_per_connection"]),
+                    str(row["io_threads"]),
+                    str(row["connections"]),
+                    f"{row['payload_size_bytes']} B",
+                    format_qps(float(row["qps_mean"])),
+                    format_ms(float(row["latency_p50_ms_mean"])),
+                    format_ms(float(row["latency_p99_ms_mean"])),
+                    format_ms(float(row["latency_p999_ms_mean"])),
+                ]
+                for row in by_kind["multiplex"]
+            ],
+        ),
+        "",
+        "## Connection Reuse Vs Reconnect",
+        "",
+        render_table(
+            ["Mode", "Connections", "Payload", "QPS", "P50", "P99", "P999"],
+            [
+                [
+                    "reconnect/request" if row["reconnect_per_request"] else "reuse",
+                    str(row["connections"]),
+                    f"{row['payload_size_bytes']} B",
+                    format_qps(float(row["qps_mean"])),
+                    format_ms(float(row["latency_p50_ms_mean"])),
+                    format_ms(float(row["latency_p99_ms_mean"])),
+                    format_ms(float(row["latency_p999_ms_mean"])),
+                ]
+                for row in by_kind["connection_mode"]
+            ],
+        ),
+        "",
+        "## Handler Cost",
+        "",
+        render_table(
+            ["Method", "Connections", "Outstanding", "Payload", "QPS", "P50", "P99", "P999"],
+            [
+                [
+                    str(row["method"]),
+                    str(row["connections"]),
+                    str(row["outstanding_per_connection"]),
+                    f"{row['payload_size_bytes']} B",
+                    format_qps(float(row["qps_mean"])),
+                    format_ms(float(row["latency_p50_ms_mean"])),
+                    format_ms(float(row["latency_p99_ms_mean"])),
+                    format_ms(float(row["latency_p999_ms_mean"])),
+                ]
+                for row in by_kind["handler"]
+            ],
+        ),
+        "",
         "## Notes",
         "",
         "- `QPS/P50/P99/P999/Avg` are the arithmetic mean across the measured repeats.",
@@ -872,27 +978,72 @@ def main() -> int:
         cases.append(
             {
                 "case_kind": "throughput",
+                "method": args.method,
                 "io_threads": args.baseline_io_threads,
                 "connections": connections,
                 "payload_size_bytes": 16,
+                "outstanding_per_connection": 1,
+                "reconnect_per_request": False,
             }
         )
     for io_threads in args.io_threads:
         cases.append(
             {
                 "case_kind": "thread_scale",
+                "method": args.method,
                 "io_threads": io_threads,
                 "connections": args.baseline_connections,
                 "payload_size_bytes": 16,
+                "outstanding_per_connection": 1,
+                "reconnect_per_request": False,
             }
         )
     for payload_size in args.payload_sizes:
         cases.append(
             {
                 "case_kind": "payload",
+                "method": args.method,
                 "io_threads": args.baseline_io_threads,
                 "connections": args.baseline_connections,
                 "payload_size_bytes": payload_size,
+                "outstanding_per_connection": 1,
+                "reconnect_per_request": False,
+            }
+        )
+    for outstanding in args.outstanding_per_connection:
+        cases.append(
+            {
+                "case_kind": "multiplex",
+                "method": args.method,
+                "io_threads": args.baseline_io_threads,
+                "connections": 1,
+                "payload_size_bytes": 16,
+                "outstanding_per_connection": outstanding,
+                "reconnect_per_request": False,
+            }
+        )
+    for reconnect_per_request in (False, True):
+        cases.append(
+            {
+                "case_kind": "connection_mode",
+                "method": args.method,
+                "io_threads": args.baseline_io_threads,
+                "connections": min(args.baseline_connections, 50),
+                "payload_size_bytes": 16,
+                "outstanding_per_connection": 1,
+                "reconnect_per_request": reconnect_per_request,
+            }
+        )
+    for method in ("EchoService.SlowEcho", "EchoService.CpuHeavy"):
+        cases.append(
+            {
+                "case_kind": "handler",
+                "method": method,
+                "io_threads": args.baseline_io_threads,
+                "connections": min(args.baseline_connections, 50),
+                "payload_size_bytes": 256,
+                "outstanding_per_connection": 1,
+                "reconnect_per_request": False,
             }
         )
 
@@ -902,12 +1053,17 @@ def main() -> int:
             case["io_threads"],
             case["connections"],
             case["payload_size_bytes"],
+            case["outstanding_per_connection"],
+            case["reconnect_per_request"],
+            case["method"],
         )
         server_log = server_logs_dir / f"{cid}.server.log"
         payload = build_payload(case["payload_size_bytes"])
         print(
             f"[bench] {cid}: io_threads={case['io_threads']} "
-            f"connections={case['connections']} payload={case['payload_size_bytes']}B",
+            f"connections={case['connections']} payload={case['payload_size_bytes']}B "
+            f"outstanding={case['outstanding_per_connection']} "
+            f"reconnect={case['reconnect_per_request']} method={case['method']}",
             flush=True,
         )
 
@@ -935,10 +1091,12 @@ def main() -> int:
                     client_path=client_path,
                     host=args.host,
                     port=args.port,
-                    method=args.method,
+                    method=case["method"],
                     connections=case["connections"],
                     duration=args.warmup,
                     payload=payload,
+                    outstanding_per_connection=case["outstanding_per_connection"],
+                    reconnect_per_request=case["reconnect_per_request"],
                 )
                 if sampler is not None:
                     sampler.set_stage("idle", 0)
@@ -969,19 +1127,24 @@ def main() -> int:
                     client_path=client_path,
                     host=args.host,
                     port=args.port,
-                    method=args.method,
+                    method=case["method"],
                     connections=case["connections"],
                     duration=args.duration,
                     payload=payload,
+                    outstanding_per_connection=case["outstanding_per_connection"],
+                    reconnect_per_request=case["reconnect_per_request"],
                 )
                 if sampler is not None:
                     sampler.set_stage("idle", repeat)
                 run["repeat"] = repeat
                 run["case_id"] = cid
                 run["case_kind"] = case["case_kind"]
+                run["method"] = case["method"]
                 run["io_threads"] = case["io_threads"]
                 run["connections"] = case["connections"]
                 run["payload_size_bytes"] = case["payload_size_bytes"]
+                run["outstanding_per_connection"] = case["outstanding_per_connection"]
+                run["reconnect_per_request"] = case["reconnect_per_request"]
                 if args.admin_port != 0:
                     metrics_text = http_get(args.host, args.admin_port, "/metrics")
                     (metrics_prom_dir / f"{cid}.repeat{repeat}.metrics.prom").write_text(
@@ -1021,9 +1184,12 @@ def main() -> int:
         row = {
             "case_id": cid,
             "case_kind": case["case_kind"],
+            "method": case["method"],
             "io_threads": case["io_threads"],
             "connections": case["connections"],
             "payload_size_bytes": case["payload_size_bytes"],
+            "outstanding_per_connection": case["outstanding_per_connection"],
+            "reconnect_per_request": case["reconnect_per_request"],
             **summary,
         }
         case_metric_snapshots = [
@@ -1034,7 +1200,17 @@ def main() -> int:
         row.update(summarize_metric_snapshots(case_metric_snapshots))
         summary_rows.append(row)
 
-    summary_rows.sort(key=lambda row: (row["case_kind"], row["io_threads"], row["connections"], row["payload_size_bytes"]))
+    summary_rows.sort(
+        key=lambda row: (
+            row["case_kind"],
+            row["method"],
+            row["io_threads"],
+            row["connections"],
+            row["payload_size_bytes"],
+            row["outstanding_per_connection"],
+            row["reconnect_per_request"],
+        )
+    )
 
     write_json(output_dir / "metadata.json", metadata)
     write_json(raw_dir / "raw_runs.json", raw_runs)

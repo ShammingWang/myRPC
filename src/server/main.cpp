@@ -13,6 +13,7 @@
 namespace {
 
 constexpr uint16_t kDefaultPort = 8080;
+volatile uint64_t g_cpu_sink = 0;
 
 size_t ReadIoThreadCountFromEnv() {
     const char* value = std::getenv("MRPC_IO_THREADS");
@@ -82,6 +83,17 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(150));
             return payload;
         });
+        dispatcher.RegisterMethod(ServiceName(), "CpuHeavy", [](const std::string& payload) {
+            uint64_t acc = 1469598103934665603ull;
+            for (int round = 0; round < 2000; ++round) {
+                for (const unsigned char ch : payload) {
+                    acc ^= static_cast<uint64_t>(ch) + static_cast<uint64_t>(round);
+                    acc *= 1099511628211ull;
+                }
+            }
+            g_cpu_sink = acc;
+            return payload;
+        });
     }
 };
 
@@ -111,7 +123,7 @@ int main() {
     }
 
     std::cout << "registered RPC methods: EchoService.Echo, EchoService.Uppercase, "
-                 "EchoService.SlowEcho\n";
+                 "EchoService.SlowEcho, EchoService.CpuHeavy\n";
     if (options.admin_port != 0) {
         std::cout << "admin metrics endpoint: http://0.0.0.0:" << options.admin_port
                   << "/metrics\n";
