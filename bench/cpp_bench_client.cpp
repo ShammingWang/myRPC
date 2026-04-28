@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -42,6 +43,7 @@ struct Args {
     double timeout = 5.0;
     uint16_t expect_status = 0;
     std::optional<std::string> expect_payload;
+    int outstanding_per_connection = 1;
     bool reconnect_per_request = false;
     std::string report_format = "text";
 };
@@ -228,6 +230,8 @@ void PrintUsage(const char* program) {
         << "  --timeout <seconds>            Socket timeout (default: 5)\n"
         << "  --expect-status <code>         Expected response status (default: 0)\n"
         << "  --expect-payload <payload>     Expected response payload\n"
+        << "  --outstanding-per-connection <n>\n"
+        << "                                 Max pipelined requests per reused connection (default: 1)\n"
         << "  --report-format <text|json>    Output format (default: text)\n"
         << "  --reconnect-per-request        Disable connection reuse\n"
         << "  --help                         Show this help message\n";
@@ -264,6 +268,9 @@ Args ParseArgs(int argc, char** argv) {
             args.expect_status = static_cast<uint16_t>(std::stoul(require_value("--expect-status")));
         } else if (flag == "--expect-payload") {
             args.expect_payload = require_value("--expect-payload");
+        } else if (flag == "--outstanding-per-connection") {
+            args.outstanding_per_connection =
+                std::stoi(require_value("--outstanding-per-connection"));
         } else if (flag == "--report-format") {
             args.report_format = require_value("--report-format");
         } else if (flag == "--reconnect-per-request") {
@@ -287,6 +294,13 @@ Args ParseArgs(int argc, char** argv) {
     }
     if (args.timeout <= 0.0) {
         throw std::invalid_argument("--timeout must be > 0");
+    }
+    if (args.outstanding_per_connection <= 0) {
+        throw std::invalid_argument("--outstanding-per-connection must be > 0");
+    }
+    if (args.reconnect_per_request && args.outstanding_per_connection != 1) {
+        throw std::invalid_argument(
+            "--outstanding-per-connection must be 1 with --reconnect-per-request");
     }
     if (args.report_format != "text" && args.report_format != "json") {
         throw std::invalid_argument("--report-format must be text or json");
@@ -410,6 +424,18 @@ Response ReadResponse(int fd) {
         RecvExact(fd, response.body.data(), body_len);
     }
     return response;
+}
+
+void ValidateResponse(const Args& args, const Response& response, uint64_t request_id) {
+    if (response.request_id != request_id) {
+        throw std::runtime_error("request_id mismatch");
+    }
+    if (response.status != args.expect_status) {
+        throw std::runtime_error("unexpected status: " + std::to_string(response.status));
+    }
+    if (args.expect_payload.has_value() && response.body != args.expect_payload.value()) {
+        throw std::runtime_error("unexpected payload");
+    }
 }
 
 SocketHandle Connect(const Args& args) {
@@ -537,15 +563,7 @@ void WorkerLoop(int worker_id, const Args& args, SharedState& state) {
                     const double latency_ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - started).count();
 
-                    if (response.request_id != request_id) {
-                        throw std::runtime_error("request_id mismatch");
-                    }
-                    if (response.status != args.expect_status) {
-                        throw std::runtime_error("unexpected status: " + std::to_string(response.status));
-                    }
-                    if (args.expect_payload.has_value() && response.body != args.expect_payload.value()) {
-                        throw std::runtime_error("unexpected payload");
-                    }
+                    ValidateResponse(args, response, request_id);
 
                     state.RecordSuccess(latency_ms, packet.size(), kHeaderSize + response.body.size());
                 } else {
@@ -558,15 +576,7 @@ void WorkerLoop(int worker_id, const Args& args, SharedState& state) {
                     const double latency_ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - started).count();
 
-                    if (response.request_id != request_id) {
-                        throw std::runtime_error("request_id mismatch");
-                    }
-                    if (response.status != args.expect_status) {
-                        throw std::runtime_error("unexpected status: " + std::to_string(response.status));
-                    }
-                    if (args.expect_payload.has_value() && response.body != args.expect_payload.value()) {
-                        throw std::runtime_error("unexpected payload");
-                    }
+                    ValidateResponse(args, response, request_id);
 
                     state.RecordSuccess(latency_ms, packet.size(), kHeaderSize + response.body.size());
                 }
@@ -583,6 +593,73 @@ void WorkerLoop(int worker_id, const Args& args, SharedState& state) {
     }
 }
 
+void WorkerLoopPipelined(int worker_id, const Args& args, SharedState& state) {
+    struct InflightRequest {
+        uint64_t request_id = 0;
+        std::chrono::steady_clock::time_point started;
+        size_t sent_bytes = 0;
+    };
+
+    SocketHandle connection;
+    std::unordered_map<uint64_t, InflightRequest> inflight;
+
+    auto close_connection = [&]() {
+        if (connection.fd >= 0) {
+            ::close(connection.release());
+        }
+    };
+
+    auto fill_pipeline = [&]() {
+        if (connection.fd < 0) {
+            connection = Connect(args);
+        }
+
+        while (!state.stop.load(std::memory_order_relaxed) &&
+               inflight.size() < static_cast<size_t>(args.outstanding_per_connection)) {
+            const std::optional<uint64_t> request_number = state.AcquireRequestIndex();
+            if (!request_number.has_value()) {
+                break;
+            }
+
+            const uint64_t request_id =
+                (static_cast<uint64_t>(worker_id) << 48) | request_number.value();
+            const std::string packet = BuildRequest(request_id, args.method, args.payload);
+            const auto started = std::chrono::steady_clock::now();
+            SendAll(connection.fd, packet);
+            inflight.emplace(request_id, InflightRequest{request_id, started, packet.size()});
+        }
+    };
+
+    try {
+        while (!state.stop.load(std::memory_order_relaxed) || !inflight.empty()) {
+            fill_pipeline();
+            if (inflight.empty()) {
+                close_connection();
+                return;
+            }
+
+            Response response = ReadResponse(connection.fd);
+            auto it = inflight.find(response.request_id);
+            if (it == inflight.end()) {
+                throw std::runtime_error("unknown response request_id");
+            }
+            const InflightRequest request = it->second;
+            inflight.erase(it);
+
+            const double latency_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - request.started).count();
+            ValidateResponse(args, response, request.request_id);
+            state.RecordSuccess(latency_ms, request.sent_bytes,
+                                kHeaderSize + response.body.size());
+        }
+        close_connection();
+    } catch (const std::exception& ex) {
+        state.RecordFailure("worker " + std::to_string(worker_id) +
+                            " request failed: " + ex.what());
+        close_connection();
+    }
+}
+
 int PrintReport(const Args& args, const SharedState& state) {
     const ReportStats stats = BuildReportStats(state);
 
@@ -593,6 +670,8 @@ int PrintReport(const Args& args, const SharedState& state) {
         std::cout << "  \"method\": \"" << JsonEscape(args.method) << "\",\n";
         std::cout << "  \"payload_size_bytes\": " << args.payload.size() << ",\n";
         std::cout << "  \"connections\": " << args.connections << ",\n";
+        std::cout << "  \"outstanding_per_connection\": "
+                  << args.outstanding_per_connection << ",\n";
         std::cout << "  \"reconnect_per_request\": "
                   << (args.reconnect_per_request ? "true" : "false") << ",\n";
         std::cout << "  \"elapsed_seconds\": " << stats.elapsed_seconds << ",\n";
@@ -619,6 +698,8 @@ int PrintReport(const Args& args, const SharedState& state) {
         std::cout << "Method       : " << args.method << "\n";
         std::cout << "Payload size : " << args.payload.size() << " bytes\n";
         std::cout << "Connections  : " << args.connections << "\n";
+        std::cout << "Outstanding  : " << args.outstanding_per_connection
+                  << " per connection\n";
         std::cout << std::fixed << std::setprecision(3);
         std::cout << "Elapsed      : " << stats.elapsed_seconds << " s\n";
         std::cout << "Completed    : " << stats.total_completed << "\n";
@@ -654,7 +735,12 @@ int main(int argc, char** argv) {
         std::vector<std::thread> workers;
         workers.reserve(static_cast<size_t>(args.connections));
         for (int i = 0; i < args.connections; ++i) {
-            workers.emplace_back(WorkerLoop, i + 1, std::cref(args), std::ref(state));
+            if (args.reconnect_per_request) {
+                workers.emplace_back(WorkerLoop, i + 1, std::cref(args), std::ref(state));
+            } else {
+                workers.emplace_back(WorkerLoopPipelined, i + 1, std::cref(args),
+                                     std::ref(state));
+            }
         }
 
         for (std::thread& worker : workers) {
