@@ -18,7 +18,7 @@
 - 请求执行：`WorkerPool` 异步执行 handler，响应回投到原 IO 线程
 - 协议模型：自定义 MRPC 二进制协议，使用 `request_id` 关联请求与响应
 - 可观测性：`/metrics`、slow log、request trace
-- 压测体系：正式 `C++ benchmark client` + 固定矩阵的 `bench/run_suite.py`
+- 压测体系：正式 `C++ benchmark client` + 固定矩阵的 `bench/run_suite.py` + `perf` profile 脚本
 - 当前 benchmark 基线：`8` 个 IO 线程下约 `45k-50k QPS`，`400` 连接时尾延迟开始明显放大
 
 ## Project Layout
@@ -204,7 +204,8 @@ python3 bench/run_suite.py --label baseline
 
 - 为每个 case 启动独立服务端实例
 - 默认开启 admin 端口并抓取 `/metrics`
-- 固定执行 `throughput / io thread scaling / payload scaling` 三组测试
+- 固定执行 `throughput / io thread scaling / payload scaling / multiplexing / connection mode / handler cost` 测试
+- 额外覆盖单连接 multiplexing、长连接 vs 短连接、慢 handler / CPU-heavy handler
 - 对每个 case 先 warmup，再做 measured repeats
 - 生成 `metadata.json / raw_runs.json / metrics_snapshots.json / summary.csv / measurements.csv / plot_series.csv / report.md`
 
@@ -212,7 +213,10 @@ python3 bench/run_suite.py --label baseline
 
 - Throughput：`connections=50,100,200,400`，`payload=16 B`
 - IO thread scaling：`io_threads=1,2,4,8,16`，`connections=200`
-- Payload scaling：`payload=16,256,4096,16384 B`，`connections=200`
+- Payload scaling：`payload=16,256,4096,16384,65536 B`，`connections=200`
+- Single-connection multiplexing：`outstanding_per_connection=1,4,16,64`
+- Connection mode：长连接复用 vs 每请求重连
+- Handler cost：`EchoService.SlowEcho` 与 `EchoService.CpuHeavy`
 
 重要字段含义：
 
@@ -276,7 +280,7 @@ python3 bench/run_suite.py --help
 - 日期：`2026-04-22`
 - 测试机器：`WSL2 x86_64`，`16 vCPU`
 - 服务方法：`EchoService.Echo`
-- payload 矩阵：`16 B / 256 B / 4096 B / 16384 B`
+- payload 矩阵：`16 B / 256 B / 4096 B / 16384 B / 65536 B`
 - benchmark duration：`6s`
 - repeats：`3`
 

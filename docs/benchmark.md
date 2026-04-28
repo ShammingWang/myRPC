@@ -48,7 +48,7 @@ python3 bench/run_suite.py --label observability-baseline
 
 - 为每个 case 启动独立服务端实例
 - 默认开启 admin 端口并自动抓取 `/metrics`
-- 固定使用同一套 `throughput / io thread scaling / payload scaling` 矩阵
+- 固定使用同一套 `throughput / io thread scaling / payload scaling / multiplexing / connection mode / handler cost` 矩阵
 - 每个 case 先跑 warmup，再跑多次 measured repeats
 - 生成 `metadata.json / raw_runs.json / metrics_snapshots.json / summary.csv / measurements.csv / plot_series.csv / report.md`
 
@@ -56,12 +56,16 @@ python3 bench/run_suite.py --label observability-baseline
 
 - Throughput sweep：`connections=50,100,200,400`，`payload=16 B`
 - IO thread scaling：`io_threads=1,2,4,8,16`，`connections=200`，`payload=16 B`
-- Payload sweep：`payload=16,256,4096,16384 B`，`connections=200`
+- Payload sweep：`payload=16,256,4096,16384,65536 B`，`connections=200`
+- Single-connection multiplexing：`connections=1`，`outstanding_per_connection=1,4,16,64`
+- Connection mode：长连接复用 vs `--reconnect-per-request`
+- Handler cost：`EchoService.SlowEcho` 与 `EchoService.CpuHeavy`
 
 常用参数：
 
 - `--duration 6 --warmup 2 --repeats 3`：控制每个 case 的测试时长和重复次数
 - `--baseline-io-threads 8`：设置默认基线 IO 线程数
+- `--outstanding-per-connection 1,4,16,64`：设置单连接 pipeline / multiplexing 压测深度
 - `--admin-port 9090`：开启管理端口并抓取 `/metrics`，设置为 `0` 可关闭
 - `--metrics-sample-interval 0.5`：压测进行中每隔多少秒抓一次 `/metrics`，设置为 `0` 可关闭周期采样
 - `--compare-with bench/results/<old>/summary.csv`：和上一次报告做前后对比
@@ -93,7 +97,7 @@ python3 bench/run_suite.py --label observability-baseline
 
 ## 为什么固定这三类维度
 
-当前 suite 选择 `throughput / io thread scaling / payload scaling` 三组 case，是为了分别回答三类问题：
+当前 suite 选择 `throughput / io thread scaling / payload scaling / multiplexing / connection mode / handler cost`，是为了分别回答几类问题：
 
 - `throughput`
   固定 `IO Threads` 和 payload，只改变 `Connections`，用来观察系统在负载上升时的吞吐上限和尾延迟变化。
@@ -101,8 +105,14 @@ python3 bench/run_suite.py --label observability-baseline
   固定 `Connections` 和 payload，只改变服务端 IO 线程数，用来验证多 IO 线程架构的扩展性，以及最佳线程数大概落在哪个区间。
 - `payload scaling`
   固定 `Connections` 和 `IO Threads`，只改变 payload 大小，用来观察协议路径、拷贝和缓冲区成本随消息体增长的变化。
+- `single-connection multiplexing`
+  固定为单条长连接，只改变单连接 outstanding request 数，用来验证 `request_id` 多路复用能力和单连接队头/排队影响。
+- `connection mode`
+  对比长连接复用与每请求重连，用来量化连接建立、accept、fd 生命周期管理对吞吐和尾延迟的影响。
+- `handler cost`
+  用慢 handler 和 CPU-heavy handler 观察瓶颈从网络路径迁移到 worker pool 或业务执行路径时的指标变化。
 
-这三类 case 共同组成一套“最小但有效”的性能基线，能在不引入太多变量的前提下，帮助定位下一步优化方向。
+这些 case 共同组成一套“最小但有效”的性能基线，能在不引入太多变量的前提下，帮助定位下一步优化方向。
 
 ## 建议记录项
 
@@ -136,8 +146,39 @@ python3 bench/run_suite.py --label observability-baseline
 
 - 统一 suite 的目标是保证“每次优化都跑同一套基准”，先稳定复现，再讨论进一步的 profiling。
 - 当前 suite 聚焦回环网络下框架内部路径的对比，更适合评估线程模型、协议路径和序列化/拷贝成本。
-- 如果后续要扩展成更完整的性能平台，可以继续补充 `perf`、火焰图、CPU 利用率和 `/metrics` 抓取。
+- `bench/profile_perf.sh` 可用于采集 `perf record`、`perf report`、客户端 JSON 和 `/metrics` 快照；如果本机安装了 FlameGraph 脚本，也会生成 `flamegraph.svg`。
 - 当前项目的测试和性能回归统一走 `bench/` 目录，不再维护 `scripts/` 下的辅助压测入口。
+
+## Perf Profile
+
+默认 profile 一次 `EchoService.Echo`、`200` 长连接、`16 B` payload、`20s`：
+
+```bash
+bench/profile_perf.sh
+```
+
+运行前需要本机 PATH 中存在 `perf`；如果要自动生成 SVG 火焰图，还需要 `stackcollapse-perf.pl` 和 `flamegraph.pl`，或者设置 `FLAMEGRAPH_DIR`。
+为了让 perf 符号更可读，建议使用 `-DCMAKE_BUILD_TYPE=RelWithDebInfo` 构建。
+
+常用参数通过环境变量覆盖：
+
+```bash
+IO_THREADS=8 \
+CONNECTIONS=1 \
+OUTSTANDING_PER_CONNECTION=64 \
+PAYLOAD_SIZE=16 \
+DURATION_SECONDS=20 \
+LABEL=multiplex-out64 \
+bench/profile_perf.sh
+```
+
+输出目录默认在 `bench/results/<timestamp>-<label>/`，其中：
+
+- `client.json`：本次 profile 的压测结果
+- `metrics.prom`：profile 结束后的 `/metrics`
+- `perf.report.txt`：热点文本报告
+- `perf.data`：原始 perf 数据
+- `flamegraph.svg`：可用时自动生成
 
 ## 2026-04-11 Single IO vs Multi IO
 
