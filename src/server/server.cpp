@@ -198,6 +198,7 @@ bool Server::StartIoThreads() {
     }
 
     for (size_t i = 0; i < io_threads_.size(); ++i) {
+        observability_->RegisterIoThread(i);
         io_threads_[i]->thread = std::thread(&Server::RunIoThread, this, i);
     }
 
@@ -266,7 +267,9 @@ void Server::RunIoThread(size_t io_thread_index) {
             break;
         }
 
+        const auto processing_started_at = std::chrono::steady_clock::now();
         if (ready == 0) {
+            observability_->OnIoThreadLoopIteration(io_thread.index, 0, std::chrono::microseconds{0});
             CloseIdleConnections(io_thread);
             continue;
         }
@@ -310,6 +313,12 @@ void Server::RunIoThread(size_t io_thread_index) {
                 CloseConnection(io_thread, fd);
             }
         }
+
+        const auto processing_finished_at = std::chrono::steady_clock::now();
+        observability_->OnIoThreadLoopIteration(
+            io_thread.index, static_cast<size_t>(ready),
+            std::chrono::duration_cast<std::chrono::microseconds>(processing_finished_at -
+                                                                  processing_started_at));
     }
 
     for (auto it = io_thread.connections.begin(); it != io_thread.connections.end();) {
@@ -443,6 +452,8 @@ void Server::EnqueueAcceptedConnection(size_t io_thread_index, AcceptedConnectio
     {
         std::lock_guard<std::mutex> lock(io_thread.mutex);
         io_thread.accepted_connections.push(std::move(connection));
+        observability_->SetIoThreadPendingResponseCount(io_thread.index,
+                                                        io_thread.completed_responses.size());
     }
     WakeIoThread(io_thread);
 }
@@ -460,6 +471,7 @@ void Server::CloseConnection(IoThreadState& io_thread, int conn_fd) {
     }
     ::close(conn_fd);
     io_thread.connections.erase(it);
+    observability_->SetIoThreadConnectionCount(io_thread.index, io_thread.connections.size());
 }
 
 bool Server::UpdateInterest(IoThreadState& io_thread, int conn_fd, const Connection& connection) {
@@ -535,6 +547,8 @@ void Server::EnqueueResponse(size_t io_thread_index, int conn_fd, uint64_t conne
         io_thread.completed_responses.push(PendingResponse{
             io_thread_index, conn_fd, connection_id, std::move(request), std::move(response),
             worker_finished_at, std::chrono::steady_clock::now()});
+        observability_->SetIoThreadPendingResponseCount(io_thread.index,
+                                                        io_thread.completed_responses.size());
     }
     WakeIoThread(io_thread);
 }
@@ -563,6 +577,8 @@ bool Server::DrainIoThreadQueues(IoThreadState& io_thread) {
         std::lock_guard<std::mutex> lock(io_thread.mutex);
         accepted_connections.swap(io_thread.accepted_connections);
         completed_responses.swap(io_thread.completed_responses);
+        observability_->SetIoThreadPendingResponseCount(io_thread.index,
+                                                        io_thread.completed_responses.size());
     }
 
     DrainAcceptedConnections(io_thread, accepted_connections);
@@ -601,6 +617,7 @@ void Server::DrainAcceptedConnections(IoThreadState& io_thread,
         io_thread.connections.emplace(
             accepted.conn_fd,
             ConnectionEntry{accepted.connection_id, std::move(connection)});
+        observability_->SetIoThreadConnectionCount(io_thread.index, io_thread.connections.size());
     }
 }
 
@@ -618,13 +635,16 @@ void Server::DrainCompletedResponses(IoThreadState& io_thread,
             continue;
         }
 
-        if (!it->second.connection.QueueResponse(pending.response)) {
+        if (!it->second.connection.QueueResponse(Connection::ResponseContext{
+                std::move(pending.request),
+                std::move(pending.response),
+                pending.worker_finished_at,
+                pending.response_enqueued_at,
+                std::chrono::steady_clock::now(),
+            })) {
             CloseConnection(io_thread, pending.conn_fd);
             continue;
         }
-        observability_->OnResponseSent(
-            pending.request, pending.response, pending.worker_finished_at,
-            pending.response_enqueued_at, std::chrono::steady_clock::now());
         if (it->second.connection.ShouldClose()) {
             CloseConnection(io_thread, pending.conn_fd);
             continue;
@@ -654,6 +674,7 @@ void Server::WakeIoThread(IoThreadState& io_thread) const {
         return;
     }
 
+    observability_->OnIoThreadWakeup(io_thread.index);
     const uint64_t wake_value = 1;
     if (::write(io_thread.wake_fd, &wake_value, sizeof(wake_value)) < 0 && errno != EAGAIN) {
         std::cerr << "wake write failed for io thread " << io_thread.index << ": "

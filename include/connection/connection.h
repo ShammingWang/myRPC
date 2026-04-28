@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <string>
@@ -20,6 +21,16 @@ struct ConnectionOptions {
 class Connection {
 public:
     using RequestExecutor = std::function<void(RpcRequest)>;
+    struct ResponseContext {
+        RpcRequest request;
+        RpcResponse response;
+        std::chrono::steady_clock::time_point worker_finished_at =
+            std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point response_enqueued_at =
+            std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point io_processing_started_at =
+            std::chrono::steady_clock::now();
+    };
 
     Connection(int conn_fd, std::string client_label, RequestExecutor request_executor,
                ConnectionOptions options = {});
@@ -32,9 +43,14 @@ public:
     bool IsIdleFor(std::chrono::steady_clock::time_point now,
                    std::chrono::milliseconds idle_timeout) const;
     void OnClosed() const;
-    bool QueueResponse(const RpcResponse& response);
+    bool QueueResponse(ResponseContext response_context);
 
 private:
+    struct BufferedResponse {
+        ResponseContext context;
+        size_t end_offset = 0;
+    };
+
     bool DrainReads();
     bool DrainWrites();
     bool ProcessRequests();
@@ -47,8 +63,10 @@ private:
     RpcCodec codec_;
     std::string inbound_buffer_;
     std::string outbound_buffer_;
+    std::deque<BufferedResponse> buffered_responses_;
     bool peer_closed_ = false;
     size_t pending_requests_ = 0;
+    size_t outbound_bytes_sent_ = 0;
     ConnectionOptions options_;
     std::chrono::steady_clock::time_point last_activity_;
 };

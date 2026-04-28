@@ -20,15 +20,24 @@ class Observability {
 public:
     explicit Observability(ObservabilityOptions options = {});
 
+    void RegisterIoThread(size_t io_thread_index);
     void OnConnectionAccepted();
     void OnConnectionClosed();
     void OnRequestDecoded(const RpcRequest& request);
     void OnRequestDispatched();
     void OnWorkerPoolRejected();
     void OnProtocolError();
+    void SetIoThreadConnectionCount(size_t io_thread_index, size_t connection_count);
+    void SetIoThreadPendingResponseCount(size_t io_thread_index, size_t pending_response_count);
+    void OnIoThreadWakeup(size_t io_thread_index);
+    void OnIoThreadLoopIteration(size_t io_thread_index, size_t ready_events,
+                                 std::chrono::microseconds processing_time);
+    void OnIoThreadWrite(size_t io_thread_index, size_t bytes_written,
+                         size_t write_calls, size_t eagain_count);
     void OnResponseSent(const RpcRequest& request, const RpcResponse& response,
                         std::chrono::steady_clock::time_point worker_finished_at,
                         std::chrono::steady_clock::time_point response_enqueued_at,
+                        std::chrono::steady_clock::time_point io_processing_started_at,
                         std::chrono::steady_clock::time_point response_sent_at);
     std::string ExportMetrics() const;
 
@@ -49,6 +58,10 @@ private:
         uint64_t queue_latency_us_max = 0;
         uint64_t handler_latency_us_total = 0;
         uint64_t handler_latency_us_max = 0;
+        uint64_t return_queue_latency_us_total = 0;
+        uint64_t return_queue_latency_us_max = 0;
+        uint64_t send_latency_us_total = 0;
+        uint64_t send_latency_us_max = 0;
         uint64_t io_return_latency_us_total = 0;
         uint64_t io_return_latency_us_max = 0;
         uint64_t end_to_end_latency_us_total = 0;
@@ -68,14 +81,34 @@ private:
         uint64_t queue_latency_us_max = 0;
         uint64_t handler_latency_us_total = 0;
         uint64_t handler_latency_us_max = 0;
+        uint64_t return_queue_latency_us_total = 0;
+        uint64_t return_queue_latency_us_max = 0;
+        uint64_t send_latency_us_total = 0;
+        uint64_t send_latency_us_max = 0;
         uint64_t io_return_latency_us_total = 0;
         uint64_t io_return_latency_us_max = 0;
         uint64_t end_to_end_latency_us_total = 0;
         uint64_t end_to_end_latency_us_max = 0;
     };
 
+    struct IoThreadSnapshot {
+        size_t io_thread_index = 0;
+        uint64_t connection_count = 0;
+        uint64_t pending_response_count = 0;
+        uint64_t wakeups = 0;
+        uint64_t loop_iterations = 0;
+        uint64_t ready_events_last = 0;
+        uint64_t ready_events_max = 0;
+        uint64_t loop_processing_us_total = 0;
+        uint64_t loop_processing_us_max = 0;
+        uint64_t write_calls = 0;
+        uint64_t write_bytes = 0;
+        uint64_t write_eagain = 0;
+    };
+
     Snapshot LoadSnapshot() const;
     std::vector<MethodSnapshot> LoadMethodSnapshots() const;
+    std::vector<IoThreadSnapshot> LoadIoThreadSnapshots() const;
     bool ShouldTrace(const RpcRequest& request, const RpcResponse& response,
                      std::chrono::milliseconds end_to_end_latency) const;
     void LogTrace(const RpcRequest& request, const RpcResponse& response,
@@ -96,10 +129,28 @@ private:
         uint64_t queue_latency_us_max = 0;
         uint64_t handler_latency_us_total = 0;
         uint64_t handler_latency_us_max = 0;
+        uint64_t return_queue_latency_us_total = 0;
+        uint64_t return_queue_latency_us_max = 0;
+        uint64_t send_latency_us_total = 0;
+        uint64_t send_latency_us_max = 0;
         uint64_t io_return_latency_us_total = 0;
         uint64_t io_return_latency_us_max = 0;
         uint64_t end_to_end_latency_us_total = 0;
         uint64_t end_to_end_latency_us_max = 0;
+    };
+
+    struct IoThreadStats {
+        std::atomic<uint64_t> connection_count{0};
+        std::atomic<uint64_t> pending_response_count{0};
+        std::atomic<uint64_t> wakeups{0};
+        std::atomic<uint64_t> loop_iterations{0};
+        std::atomic<uint64_t> ready_events_last{0};
+        std::atomic<uint64_t> ready_events_max{0};
+        std::atomic<uint64_t> loop_processing_us_total{0};
+        std::atomic<uint64_t> loop_processing_us_max{0};
+        std::atomic<uint64_t> write_calls{0};
+        std::atomic<uint64_t> write_bytes{0};
+        std::atomic<uint64_t> write_eagain{0};
     };
 
     ObservabilityOptions options_;
@@ -118,12 +169,18 @@ private:
     std::atomic<uint64_t> queue_latency_us_max_{0};
     std::atomic<uint64_t> handler_latency_us_total_{0};
     std::atomic<uint64_t> handler_latency_us_max_{0};
+    std::atomic<uint64_t> return_queue_latency_us_total_{0};
+    std::atomic<uint64_t> return_queue_latency_us_max_{0};
+    std::atomic<uint64_t> send_latency_us_total_{0};
+    std::atomic<uint64_t> send_latency_us_max_{0};
     std::atomic<uint64_t> io_return_latency_us_total_{0};
     std::atomic<uint64_t> io_return_latency_us_max_{0};
     std::atomic<uint64_t> end_to_end_latency_us_total_{0};
     std::atomic<uint64_t> end_to_end_latency_us_max_{0};
     mutable std::mutex method_stats_mutex_;
     std::unordered_map<std::string, MethodStats> method_stats_;
+    mutable std::mutex io_thread_stats_mutex_;
+    std::unordered_map<size_t, IoThreadStats> io_thread_stats_;
     mutable std::mutex log_mutex_;
     std::chrono::steady_clock::time_point start_time_;
 };

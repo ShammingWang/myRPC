@@ -71,15 +71,17 @@ void Connection::OnClosed() const {
     }
 }
 
-bool Connection::QueueResponse(const RpcResponse& response) {
+bool Connection::QueueResponse(ResponseContext response_context) {
     std::string encoded;
-    codec_.EncodeResponse(response, encoded);
+    codec_.EncodeResponse(response_context.response, encoded);
     if (outbound_buffer_.size() + encoded.size() > options_.max_outbound_buffer_bytes) {
         std::cerr << "outbound buffer exceeded for " << client_label_ << '\n';
         return false;
     }
 
+    const size_t end_offset = outbound_bytes_sent_ + outbound_buffer_.size() + encoded.size();
     outbound_buffer_.append(encoded);
+    buffered_responses_.push_back(BufferedResponse{std::move(response_context), end_offset});
     if (pending_requests_ > 0) {
         --pending_requests_;
     }
@@ -115,6 +117,8 @@ bool Connection::DrainReads() {
 
 bool Connection::DrainWrites() {
     size_t written = 0;
+    size_t write_calls = 0;
+    size_t eagain_count = 0;
     while (written < outbound_buffer_.size()) {
         const ssize_t n =
             ::write(conn_fd_, outbound_buffer_.data() + written, outbound_buffer_.size() - written);
@@ -123,18 +127,60 @@ bool Connection::DrainWrites() {
                 continue;
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                ++eagain_count;
+                if (options_.observability) {
+                    options_.observability->OnIoThreadWrite(options_.io_thread_index, written,
+                                                            write_calls, eagain_count);
+                }
+                outbound_bytes_sent_ += written;
+                while (!buffered_responses_.empty() &&
+                       buffered_responses_.front().end_offset <= outbound_bytes_sent_) {
+                    const BufferedResponse buffered = std::move(buffered_responses_.front());
+                    buffered_responses_.pop_front();
+                    if (options_.observability) {
+                        options_.observability->OnResponseSent(
+                            buffered.context.request, buffered.context.response,
+                            buffered.context.worker_finished_at,
+                            buffered.context.response_enqueued_at,
+                            buffered.context.io_processing_started_at,
+                            std::chrono::steady_clock::now());
+                    }
+                }
                 outbound_buffer_.erase(0, written);
                 return true;
+            }
+            if (options_.observability) {
+                options_.observability->OnIoThreadWrite(options_.io_thread_index, written,
+                                                        write_calls, eagain_count);
             }
             std::cerr << "write failed for " << client_label_ << ": " << std::strerror(errno)
                       << '\n';
             return false;
         }
 
+        ++write_calls;
         written += static_cast<size_t>(n);
         Touch();
     }
 
+    if (options_.observability) {
+        options_.observability->OnIoThreadWrite(options_.io_thread_index, written, write_calls,
+                                                eagain_count);
+    }
+    outbound_bytes_sent_ += written;
+    while (!buffered_responses_.empty() &&
+           buffered_responses_.front().end_offset <= outbound_bytes_sent_) {
+        const BufferedResponse buffered = std::move(buffered_responses_.front());
+        buffered_responses_.pop_front();
+        if (options_.observability) {
+            options_.observability->OnResponseSent(
+                buffered.context.request, buffered.context.response,
+                buffered.context.worker_finished_at,
+                buffered.context.response_enqueued_at,
+                buffered.context.io_processing_started_at,
+                std::chrono::steady_clock::now());
+        }
+    }
     outbound_buffer_.clear();
     return true;
 }

@@ -53,6 +53,11 @@ std::string EscapePrometheusLabelValue(const std::string& input) {
 Observability::Observability(ObservabilityOptions options)
     : options_(std::move(options)), start_time_(Clock::now()) {}
 
+void Observability::RegisterIoThread(size_t io_thread_index) {
+    std::lock_guard<std::mutex> lock(io_thread_stats_mutex_);
+    io_thread_stats_.try_emplace(io_thread_index);
+}
+
 void Observability::OnConnectionAccepted() {
     accepted_connections_.fetch_add(1, std::memory_order_relaxed);
     active_connections_.fetch_add(1, std::memory_order_relaxed);
@@ -81,9 +86,61 @@ void Observability::OnProtocolError() {
     protocol_errors_.fetch_add(1, std::memory_order_relaxed);
 }
 
+void Observability::SetIoThreadConnectionCount(size_t io_thread_index, size_t connection_count) {
+    std::lock_guard<std::mutex> lock(io_thread_stats_mutex_);
+    IoThreadStats& stats = io_thread_stats_[io_thread_index];
+    stats.connection_count.store(static_cast<uint64_t>(connection_count),
+                                 std::memory_order_relaxed);
+}
+
+void Observability::SetIoThreadPendingResponseCount(size_t io_thread_index,
+                                                    size_t pending_response_count) {
+    std::lock_guard<std::mutex> lock(io_thread_stats_mutex_);
+    IoThreadStats& stats = io_thread_stats_[io_thread_index];
+    stats.pending_response_count.store(static_cast<uint64_t>(pending_response_count),
+                                       std::memory_order_relaxed);
+}
+
+void Observability::OnIoThreadWakeup(size_t io_thread_index) {
+    std::lock_guard<std::mutex> lock(io_thread_stats_mutex_);
+    IoThreadStats& stats = io_thread_stats_[io_thread_index];
+    stats.wakeups.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Observability::OnIoThreadLoopIteration(size_t io_thread_index, size_t ready_events,
+                                            std::chrono::microseconds processing_time) {
+    const uint64_t ready_events_u64 = static_cast<uint64_t>(ready_events);
+    const uint64_t processing_us =
+        static_cast<uint64_t>(std::max<int64_t>(0, processing_time.count()));
+    std::lock_guard<std::mutex> lock(io_thread_stats_mutex_);
+    IoThreadStats& stats = io_thread_stats_[io_thread_index];
+    stats.loop_iterations.fetch_add(1, std::memory_order_relaxed);
+    stats.ready_events_last.store(ready_events_u64, std::memory_order_relaxed);
+    UpdateMax(stats.ready_events_max, ready_events_u64);
+    stats.loop_processing_us_total.fetch_add(processing_us, std::memory_order_relaxed);
+    UpdateMax(stats.loop_processing_us_max, processing_us);
+}
+
+void Observability::OnIoThreadWrite(size_t io_thread_index, size_t bytes_written,
+                                    size_t write_calls, size_t eagain_count) {
+    if (bytes_written == 0 && write_calls == 0 && eagain_count == 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(io_thread_stats_mutex_);
+    IoThreadStats& stats = io_thread_stats_[io_thread_index];
+    stats.write_bytes.fetch_add(static_cast<uint64_t>(bytes_written),
+                                std::memory_order_relaxed);
+    stats.write_calls.fetch_add(static_cast<uint64_t>(write_calls),
+                                std::memory_order_relaxed);
+    stats.write_eagain.fetch_add(static_cast<uint64_t>(eagain_count),
+                                 std::memory_order_relaxed);
+}
+
 void Observability::OnResponseSent(const RpcRequest& request, const RpcResponse& response,
                                    Clock::time_point worker_finished_at,
                                    Clock::time_point response_enqueued_at,
+                                   Clock::time_point io_processing_started_at,
                                    Clock::time_point response_sent_at) {
     completed_requests_.fetch_add(1, std::memory_order_relaxed);
     inflight_requests_.fetch_sub(1, std::memory_order_relaxed);
@@ -105,6 +162,10 @@ void Observability::OnResponseSent(const RpcRequest& request, const RpcResponse&
         request.worker_started_at - request.enqueued_at);
     const auto handler_latency = std::chrono::duration_cast<std::chrono::milliseconds>(
         worker_finished_at - request.worker_started_at);
+    const auto return_queue_latency = std::chrono::duration_cast<std::chrono::milliseconds>(
+        io_processing_started_at - response_enqueued_at);
+    const auto send_latency = std::chrono::duration_cast<std::chrono::milliseconds>(
+        response_sent_at - io_processing_started_at);
     const auto io_return_latency = std::chrono::duration_cast<std::chrono::milliseconds>(
         response_sent_at - response_enqueued_at);
     const auto end_to_end_latency = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -113,6 +174,10 @@ void Observability::OnResponseSent(const RpcRequest& request, const RpcResponse&
         std::max<int64_t>(0, ToMicroseconds(request.worker_started_at - request.enqueued_at)));
     const uint64_t handler_latency_us = static_cast<uint64_t>(
         std::max<int64_t>(0, ToMicroseconds(worker_finished_at - request.worker_started_at)));
+    const uint64_t return_queue_latency_us = static_cast<uint64_t>(
+        std::max<int64_t>(0, ToMicroseconds(io_processing_started_at - response_enqueued_at)));
+    const uint64_t send_latency_us = static_cast<uint64_t>(
+        std::max<int64_t>(0, ToMicroseconds(response_sent_at - io_processing_started_at)));
     const uint64_t io_return_latency_us = static_cast<uint64_t>(
         std::max<int64_t>(0, ToMicroseconds(response_sent_at - response_enqueued_at)));
     const uint64_t end_to_end_latency_us = static_cast<uint64_t>(
@@ -120,10 +185,14 @@ void Observability::OnResponseSent(const RpcRequest& request, const RpcResponse&
 
     queue_latency_us_total_.fetch_add(queue_latency_us, std::memory_order_relaxed);
     handler_latency_us_total_.fetch_add(handler_latency_us, std::memory_order_relaxed);
+    return_queue_latency_us_total_.fetch_add(return_queue_latency_us, std::memory_order_relaxed);
+    send_latency_us_total_.fetch_add(send_latency_us, std::memory_order_relaxed);
     io_return_latency_us_total_.fetch_add(io_return_latency_us, std::memory_order_relaxed);
     end_to_end_latency_us_total_.fetch_add(end_to_end_latency_us, std::memory_order_relaxed);
     UpdateMax(queue_latency_us_max_, queue_latency_us);
     UpdateMax(handler_latency_us_max_, handler_latency_us);
+    UpdateMax(return_queue_latency_us_max_, return_queue_latency_us);
+    UpdateMax(send_latency_us_max_, send_latency_us);
     UpdateMax(io_return_latency_us_max_, io_return_latency_us);
     UpdateMax(end_to_end_latency_us_max_, end_to_end_latency_us);
 
@@ -147,11 +216,16 @@ void Observability::OnResponseSent(const RpcRequest& request, const RpcResponse&
         }
         stats.queue_latency_us_total += queue_latency_us;
         stats.handler_latency_us_total += handler_latency_us;
+        stats.return_queue_latency_us_total += return_queue_latency_us;
+        stats.send_latency_us_total += send_latency_us;
         stats.io_return_latency_us_total += io_return_latency_us;
         stats.end_to_end_latency_us_total += end_to_end_latency_us;
         stats.queue_latency_us_max = std::max(stats.queue_latency_us_max, queue_latency_us);
         stats.handler_latency_us_max =
             std::max(stats.handler_latency_us_max, handler_latency_us);
+        stats.return_queue_latency_us_max =
+            std::max(stats.return_queue_latency_us_max, return_queue_latency_us);
+        stats.send_latency_us_max = std::max(stats.send_latency_us_max, send_latency_us);
         stats.io_return_latency_us_max =
             std::max(stats.io_return_latency_us_max, io_return_latency_us);
         stats.end_to_end_latency_us_max =
@@ -210,6 +284,18 @@ std::string Observability::ExportMetrics() const {
     out << "# TYPE mrpc_latency_handler_max_ms gauge\n";
     out << "mrpc_latency_handler_max_ms "
         << MicrosecondsToMilliseconds(snapshot.handler_latency_us_max) << '\n';
+    out << "# TYPE mrpc_latency_return_queue_average_ms gauge\n";
+    out << "mrpc_latency_return_queue_average_ms "
+        << MicrosecondsToMilliseconds(snapshot.return_queue_latency_us_total) / completed << '\n';
+    out << "# TYPE mrpc_latency_return_queue_max_ms gauge\n";
+    out << "mrpc_latency_return_queue_max_ms "
+        << MicrosecondsToMilliseconds(snapshot.return_queue_latency_us_max) << '\n';
+    out << "# TYPE mrpc_latency_send_average_ms gauge\n";
+    out << "mrpc_latency_send_average_ms "
+        << MicrosecondsToMilliseconds(snapshot.send_latency_us_total) / completed << '\n';
+    out << "# TYPE mrpc_latency_send_max_ms gauge\n";
+    out << "mrpc_latency_send_max_ms "
+        << MicrosecondsToMilliseconds(snapshot.send_latency_us_max) << '\n';
     out << "# TYPE mrpc_latency_io_return_average_ms gauge\n";
     out << "mrpc_latency_io_return_average_ms "
         << MicrosecondsToMilliseconds(snapshot.io_return_latency_us_total) / completed << '\n';
@@ -222,6 +308,35 @@ std::string Observability::ExportMetrics() const {
     out << "# TYPE mrpc_latency_end_to_end_max_ms gauge\n";
     out << "mrpc_latency_end_to_end_max_ms "
         << MicrosecondsToMilliseconds(snapshot.end_to_end_latency_us_max) << '\n';
+
+    const std::vector<IoThreadSnapshot> io_threads = LoadIoThreadSnapshots();
+    for (const IoThreadSnapshot& io_thread : io_threads) {
+        const std::string label =
+            "{io_thread=\"" + std::to_string(io_thread.io_thread_index) + "\"}";
+        const double iterations = std::max<uint64_t>(io_thread.loop_iterations, 1);
+        out << "mrpc_io_thread_connections" << label << ' ' << io_thread.connection_count
+            << '\n';
+        out << "mrpc_io_thread_pending_responses" << label << ' '
+            << io_thread.pending_response_count << '\n';
+        out << "mrpc_io_thread_wakeups_total" << label << ' ' << io_thread.wakeups << '\n';
+        out << "mrpc_io_thread_loop_iterations_total" << label << ' '
+            << io_thread.loop_iterations << '\n';
+        out << "mrpc_io_thread_ready_events_last" << label << ' '
+            << io_thread.ready_events_last << '\n';
+        out << "mrpc_io_thread_ready_events_max" << label << ' ' << io_thread.ready_events_max
+            << '\n';
+        out << "mrpc_io_thread_loop_processing_average_ms" << label << ' '
+            << MicrosecondsToMilliseconds(io_thread.loop_processing_us_total) / iterations
+            << '\n';
+        out << "mrpc_io_thread_loop_processing_max_ms" << label << ' '
+            << MicrosecondsToMilliseconds(io_thread.loop_processing_us_max) << '\n';
+        out << "mrpc_io_thread_write_calls_total" << label << ' ' << io_thread.write_calls
+            << '\n';
+        out << "mrpc_io_thread_write_bytes_total" << label << ' ' << io_thread.write_bytes
+            << '\n';
+        out << "mrpc_io_thread_write_eagain_total" << label << ' ' << io_thread.write_eagain
+            << '\n';
+    }
 
     const std::vector<MethodSnapshot> methods = LoadMethodSnapshots();
     for (const MethodSnapshot& method : methods) {
@@ -250,6 +365,16 @@ std::string Observability::ExportMetrics() const {
             << '\n';
         out << "mrpc_method_latency_handler_max_ms" << label << ' '
             << MicrosecondsToMilliseconds(method.handler_latency_us_max) << '\n';
+        out << "mrpc_method_latency_return_queue_average_ms" << label << ' '
+            << MicrosecondsToMilliseconds(method.return_queue_latency_us_total) / method_completed
+            << '\n';
+        out << "mrpc_method_latency_return_queue_max_ms" << label << ' '
+            << MicrosecondsToMilliseconds(method.return_queue_latency_us_max) << '\n';
+        out << "mrpc_method_latency_send_average_ms" << label << ' '
+            << MicrosecondsToMilliseconds(method.send_latency_us_total) / method_completed
+            << '\n';
+        out << "mrpc_method_latency_send_max_ms" << label << ' '
+            << MicrosecondsToMilliseconds(method.send_latency_us_max) << '\n';
         out << "mrpc_method_latency_io_return_average_ms" << label << ' '
             << MicrosecondsToMilliseconds(method.io_return_latency_us_total) / method_completed
             << '\n';
@@ -281,6 +406,12 @@ Observability::Snapshot Observability::LoadSnapshot() const {
     snapshot.queue_latency_us_max = queue_latency_us_max_.load(std::memory_order_relaxed);
     snapshot.handler_latency_us_total = handler_latency_us_total_.load(std::memory_order_relaxed);
     snapshot.handler_latency_us_max = handler_latency_us_max_.load(std::memory_order_relaxed);
+    snapshot.return_queue_latency_us_total =
+        return_queue_latency_us_total_.load(std::memory_order_relaxed);
+    snapshot.return_queue_latency_us_max =
+        return_queue_latency_us_max_.load(std::memory_order_relaxed);
+    snapshot.send_latency_us_total = send_latency_us_total_.load(std::memory_order_relaxed);
+    snapshot.send_latency_us_max = send_latency_us_max_.load(std::memory_order_relaxed);
     snapshot.io_return_latency_us_total =
         io_return_latency_us_total_.load(std::memory_order_relaxed);
     snapshot.io_return_latency_us_max = io_return_latency_us_max_.load(std::memory_order_relaxed);
@@ -309,6 +440,10 @@ std::vector<Observability::MethodSnapshot> Observability::LoadMethodSnapshots() 
             stats.queue_latency_us_max,
             stats.handler_latency_us_total,
             stats.handler_latency_us_max,
+            stats.return_queue_latency_us_total,
+            stats.return_queue_latency_us_max,
+            stats.send_latency_us_total,
+            stats.send_latency_us_max,
             stats.io_return_latency_us_total,
             stats.io_return_latency_us_max,
             stats.end_to_end_latency_us_total,
@@ -318,6 +453,33 @@ std::vector<Observability::MethodSnapshot> Observability::LoadMethodSnapshots() 
     std::sort(snapshots.begin(), snapshots.end(),
               [](const MethodSnapshot& left, const MethodSnapshot& right) {
                   return left.method < right.method;
+              });
+    return snapshots;
+}
+
+std::vector<Observability::IoThreadSnapshot> Observability::LoadIoThreadSnapshots() const {
+    std::vector<IoThreadSnapshot> snapshots;
+    std::lock_guard<std::mutex> lock(io_thread_stats_mutex_);
+    snapshots.reserve(io_thread_stats_.size());
+    for (const auto& [io_thread_index, stats] : io_thread_stats_) {
+        snapshots.push_back(IoThreadSnapshot{
+            io_thread_index,
+            stats.connection_count.load(std::memory_order_relaxed),
+            stats.pending_response_count.load(std::memory_order_relaxed),
+            stats.wakeups.load(std::memory_order_relaxed),
+            stats.loop_iterations.load(std::memory_order_relaxed),
+            stats.ready_events_last.load(std::memory_order_relaxed),
+            stats.ready_events_max.load(std::memory_order_relaxed),
+            stats.loop_processing_us_total.load(std::memory_order_relaxed),
+            stats.loop_processing_us_max.load(std::memory_order_relaxed),
+            stats.write_calls.load(std::memory_order_relaxed),
+            stats.write_bytes.load(std::memory_order_relaxed),
+            stats.write_eagain.load(std::memory_order_relaxed),
+        });
+    }
+    std::sort(snapshots.begin(), snapshots.end(),
+              [](const IoThreadSnapshot& left, const IoThreadSnapshot& right) {
+                  return left.io_thread_index < right.io_thread_index;
               });
     return snapshots;
 }
